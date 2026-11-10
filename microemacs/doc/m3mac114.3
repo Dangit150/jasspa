@@ -1,0 +1,199 @@
+.\" -*- nroff -*-
+.\" Copyright (C) 2026 JASSPA (www.jasspa.com)
+.\"
+.\" This is part of JASSPA's MicroEmacs, see the LICENSE file for licensing and
+.\" copying information.
+.\"
+.Id $Id: m3mac114.3,v 1.1 2026/11/10 23:30:00 daniel Exp $
+.Im MicroEmacs command|file
+.so me.tni
+.TH ai-chat 3
+.XI ai-chat - "Open the AI coding assistant chat"
+.XI ai-send - "Send the chat question to the AI"
+.XI ai-ask - "Ask the AI a one line question"
+.XI ai-code-action - "Ask the AI about the region or buffer"
+.XI ai-insert-block - "Insert a code block from the AI chat"
+.XI ai-new - "Start a new AI chat"
+.XI ai-cancel - "Cancel the AI reply"
+.XI ai-set-model - "Choose the AI model"
+.SH NAME
+.Me "|ai-chat"
+ai-chat \- Open the AI coding assistant chat
+.br
+.Me "|ai-send"
+ai-send \- Send the chat question to the AI
+.br
+.Me "|ai-ask"
+ai-ask \- Ask the AI a one line question
+.br
+.Me "|ai-code-action"
+ai-code-action \- Ask the AI about the region or buffer
+.br
+.Me "|ai-insert-block"
+ai-insert-block \- Insert a code block from the AI chat
+.br
+.Me "|ai-new"
+ai-new \- Start a new AI chat
+.br
+.Me "|ai-cancel"
+ai-cancel \- Cancel the AI reply
+.br
+.Me "|ai-set-model"
+ai-set-model \- Choose the AI model
+.Me $a
+.SH SYNOPSIS
+.na
+\fBai-chat\fR
+.br
+\fBai-send\fR
+.br
+\fBai-ask\fR "\fIquestion\fR"
+.br
+\fBai-code-action\fR "\fIaction\fR|\fIquestion\fR"
+.br
+\fBai-insert-block\fR [\|\fCr\fR|\fCi\fR|\fCc\fR\|]
+.br
+\fBai-new\fR
+.br
+\fBai-cancel\fR
+.br
+\fBai-set-model\fR "\fImodel\fR"
+.ad
+.SH DESCRIPTION
+These commands hold a conversation about code with an AI model through an OpenAI
+compatible chat completions API, either OpenAI itself or a local server such as
+Ollama, LM Studio or llama.cpp.
+.PP
+The conversation is the text of the \fC*ai-chat*\fR buffer. Each part starts
+with a line holding just \fC## You\fR, \fC## AI\fR or \fC## System\fR, anything
+before the first of these is ignored. The whole chat is sent with every
+question, so earlier questions and answers may be edited or deleted to change
+what the model sees, and the buffer may be saved to a file and the chat carried
+on later from any buffer holding these lines. A \fC## System\fR part replaces the
+system prompt given by \fB%ai-system-prompt\fR. The buffer uses the markdown
+major mode so the code blocks in a reply are hilighted.
+.PP
+.B ai-chat
+shows the \fC*ai-chat*\fR buffer in a popup window and moves to its end, ready
+for a question to be written under the last \fC## You\fR line.
+.PP
+.B ai-send
+sends the chat in the current buffer, the last part of which must be a
+\fC## You\fR question. The reply is added under a new \fC## AI\fR line, followed
+by an empty \fC## You\fR for the next question. Only one request may run at a
+time. In the \fC*ai-chat*\fR buffer the following keys are bound:
+.IP "\fC\*cc \*cc\fR"
+.B ai-send
+.IP "\fC\*cc \*ck\fR"
+.B ai-cancel
+.IP "\fC\*cc i\fR"
+.B ai-insert-block
+.IP "\fC\*cc n\fR"
+.B ai-new
+.IP "\fC\*cc m\fR"
+.B ai-set-model
+.LP
+.B ai-ask
+prompts for a one line question, adds it to the chat and sends it, leaving the
+cursor where it was while the reply appears in the chat window.
+.PP
+.B ai-code-action
+sends code from the current buffer with an instruction. The code is the active
+region, or the whole buffer when there is none, and goes into the chat as a
+fenced block tagged with the buffer's major mode, after a line naming the buffer
+and the lines sent. The user is prompted for one of the actions listed in
+\fB%ai-actions\fR, with completion, or may type any other question instead. The
+actions are:
+.IP \fBexplain\fR
+Explain what the code does.
+.IP \fBreview\fR
+List bugs, edge cases and readability problems, most serious first.
+.IP \fBfix\fR
+Reply with the corrected code and a list of the changes.
+.IP \fBdocument\fR
+Reply with the code with documentation comments added.
+.IP \fBtests\fR
+Write unit tests for the code.
+.IP \fBsimplify\fR
+Reply with simpler code that behaves the same.
+.LP
+The text of action \fIname\fR is held in \fB%ai-action-\fIname\fR, so an action
+may be changed, or a new one added to \fB%ai-actions\fR with its own variable.
+.PP
+.B ai-insert-block
+copies a fenced code block from the chat. In the chat it uses the block holding
+the cursor, or the last block before it; from any other buffer it uses the last
+block in \fC*ai-chat*\fR. The user is then asked whether to replace the region
+last sent by
+.B ai-code-action
+with it (\fCr\fR, only offered when a region was sent), to insert it at the
+cursor of that buffer (\fCi\fR) or just to copy it to the kill buffer and the
+system clipboard (\fCc\fR). The choice may instead be given as an argument. A
+replacement can be repeated with a later block, as the region is moved to cover
+the new code.
+.PP
+.B ai-new
+clears the chat, asking first if it holds any replies.
+.PP
+.B ai-cancel
+stops a reply that is streaming in, keeping what has arrived so far.
+.PP
+.B ai-set-model
+fetches the list of models from the server and prompts for one, with
+completion. If the list cannot be fetched any name may be typed. The model is
+saved in the registry, so it is remembered by later sessions; when no model has
+been set the first request prompts for one.
+.SH CONFIGURATION
+The following variables may be set in the user's \fIuser\fR.emf setup file:
+.IP \fB%ai-base-url\fR
+The API address, \fChttps://api.openai.com/v1\fR by default.
+.IP \fB%ai-api-key\fR
+The API key. When empty the \fCOPENAI_API_KEY\fR environment variable is used,
+which avoids writing the key into a setup file. A local server usually needs no
+key.
+.IP \fB%ai-model\fR
+The model, normally set with
+.BR ai-set-model .
+.IP \fB%ai-transport\fR
+\fCcurl\fR to stream the reply through \fCcurl\fR, \fChttp\fR to use the built in
+HTTP client, or empty (the default) to use \fCcurl\fR when it is found on the
+path. \fB%ai-curl\fR gives the \fCcurl\fR program, \fCcurl\fR by default.
+.IP \fB%ai-system-prompt\fR
+The instructions sent before the chat.
+.IP \fB%ai-wrap\fR
+When 1 (the default) the long prose lines of a reply are split at the buffer's
+fill column once it has arrived, leaving code blocks, tables and headings alone.
+Set to 0 to keep the reply as sent.
+.LP
+For example, to use a coding model served by Ollama on the local machine:
+.Me $emf-scheme
+.CS
+set-variable %ai-base-url "http://localhost:11434/v1"
+set-variable %ai-model "qwen2.5-coder"
+.CE 0
+.Me $ehf-scheme
+.SH NOTES
+These are macros defined in \fCaichat.emf\fR.
+.PP
+Nothing is sent unless one of the commands above is run, but everything in the
+chat, including any code added to it, is then sent to the server.
+.PP
+With \fCcurl\fR the reply streams into the chat as it is written and editing can
+carry on meanwhile. The API key is passed in a header file readable only by the
+user, which is deleted as soon as the reply starts. The built in HTTP client
+waits for the whole reply, during which the editor does not respond; it keeps
+the key in memory, removing flag \fCd\fR from \fB%http-flags\fR for the request
+so the key is not logged in \fC*http-console*\fR. HTTPS through the built in
+client needs a version of \*(mS built with OpenSSL.
+.PP
+A reply line cannot grow past the 65000 character line limit, so a longer one is
+broken. A request is built as UTF-8, which needs a version of \*(mS with Unicode
+support for characters outside ASCII.
+.SH "SEE ALSO"
+.na
+.Ht ipipe-shell-command 2 ,
+.Ht %http-header 5 ,
+.Ht %http-post-file 5 ,
+.Ht json-format 3 .
+.ad
+.FH
