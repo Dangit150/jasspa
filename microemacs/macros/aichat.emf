@@ -15,6 +15,8 @@
 ;
 !iif &not &exi %ai-base-url       set-variable %ai-base-url "https://api.openai.com/v1"
 !iif &not &exi %ai-model          set-variable %ai-model &reg "/history/ai-chat/model" ""
+!iif &not &exi %ai-effort         set-variable %ai-effort &reg "/history/ai-chat/effort" ""
+!iif &not &exi %ai-efforts        set-variable %ai-efforts "|none|minimal|low|medium|high|xhigh|"
 !iif &not &exi %ai-api-key        set-variable %ai-api-key ""
 !iif &not &exi %ai-transport      set-variable %ai-transport ""
 !iif &not &exi %ai-curl           set-variable %ai-curl "curl"
@@ -104,6 +106,7 @@ set-variable %ai-undo-new 0
     buffer-bind-key ai-insert-block "C-c i"
     buffer-bind-key ai-new "C-c n"
     buffer-bind-key ai-set-model "C-c m"
+    buffer-bind-key ai-set-effort "C-c r"
     buffer-bind-key ai-attach "C-c f"
     buffer-bind-key ai-show-attachment "C-c v"
     buffer-bind-key ai-apply-edits "C-c a"
@@ -788,7 +791,17 @@ define-macro ai-chat
   set-variable %ai-req-col $window-col
   insert-string %ai-model
   ai-req-escape
-  insert-string &spr "\",\"stream\":%s,\"messages\":[" &con @1 "true" "false"
+  insert-string &spr "\",\"stream\":%s," &con @1 "true" "false"
+  ; the reasoning effort is only sent when set, a model without reasoning may refuse it
+  !if &len %ai-effort
+    insert-string "\"reasoning_effort\":\""
+    set-variable %ai-req-line $window-line
+    set-variable %ai-req-col $window-col
+    insert-string %ai-effort
+    ai-req-escape
+    insert-string "\","
+  !endif
+  insert-string "\"messages\":["
   set-variable #l7 ""
   find-buffer #l0
   set-variable #l4 0
@@ -1186,12 +1199,12 @@ define-macro ai-chat
   !iif &seq #l2 ""  set-variable #l2 &con &seq &which %ai-curl "ERROR" "http" "curl"
   set-variable %ai-target $buffer-bname
   ai-build-request &seq #l2 "curl"
-  set-variable %ai-req-note ""
+  set-variable %ai-req-note &con &len %ai-effort &spr ", %s effort" %ai-effort ""
   !if %ai-req-atts
     set-variable #l4 &stat "s" %ai-req-file
     set-variable #l5 &div #l4 4
     set-variable #l5 &con &les #l5 1000 #l5 &spr "%dK" &div &add #l5 500 1000
-    set-variable %ai-req-note &spr ", %d attachment%s, about %s tokens" %ai-req-atts &con &equ %ai-req-atts 1 "" "s" #l5
+    set-variable %ai-req-note &spr "%s, %d attachment%s, about %s tokens" %ai-req-note %ai-req-atts &con &equ %ai-req-atts 1 "" "s" #l5
     !if &gre #l4 %ai-attach-max
       !if &not &iseq @mc1 &spr "The request is about %s tokens, send it (y/n)? " #l5 "yYnN" "y"
         !force 0x20 file-op %ai-req-file
@@ -3047,4 +3060,21 @@ define-macro ai-set-model
     !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
   !endif
   ml-write &spr "[AI: using model %s]" #l1
+!emacro
+
+; set how hard a reasoning model thinks, sent as reasoning_effort, completing from %ai-efforts.
+; Empty leaves it to the model, which is needed for one that does not reason
+define-macro ai-set-effort
+  !force set-variable #l1 @1
+  !if &not $status
+    !force set-variable #l1 @ml29 "AI effort (empty for the model's own)" %ai-effort %ai-efforts
+    !iif &not $status  !abort
+  !endif
+  set-variable #l1 &trb #l1
+  set-variable %ai-effort #l1
+  !if &not &seq #l1 &reg "/history/ai-chat/effort" ""
+    set-registry "/history/ai-chat/effort" #l1
+    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
+  !endif
+  ml-write &con &len #l1 &spr "[AI: using %s effort]" #l1 "[AI: effort left to the model]"
 !emacro

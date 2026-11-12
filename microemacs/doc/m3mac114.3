@@ -16,6 +16,7 @@
 .XI ai-new - "Start a new AI chat"
 .XI ai-cancel - "Cancel the AI reply"
 .XI ai-set-model - "Choose the AI model"
+.XI ai-set-effort - "Choose how hard the AI model reasons"
 .XI ai-attach - "Attach a file or lines of one to the AI chat"
 .XI ai-show-attachment - "Show the lines of an AI chat attachment"
 .XI ai-apply-edits - "Apply the edits of an AI reply"
@@ -45,6 +46,9 @@ ai-cancel \- Cancel the AI reply
 .br
 .Me "|ai-set-model"
 ai-set-model \- Choose the AI model
+.br
+.Me "|ai-set-effort"
+ai-set-effort \- Choose how hard the AI model reasons
 .br
 .Me "|ai-attach"
 ai-attach \- Attach a file or lines of one to the AI chat
@@ -78,6 +82,8 @@ ai-edit \- Ask the AI to change the attached code
 \fBai-cancel\fR
 .br
 \fBai-set-model\fR "\fImodel\fR"
+.br
+\fBai-set-effort\fR "\fIeffort\fR"
 .br
 \fBai-attach\fR [\|"\fIfile\fR"\|]
 .br
@@ -148,6 +154,8 @@ time. In the \fC*ai-chat*\fR buffer the following keys are bound:
 .B ai-new
 .IP "\fC\*cc m\fR"
 .B ai-set-model
+.IP "\fC\*cc r\fR"
+.B ai-set-effort
 .IP "\fC\*cc f\fR"
 .B ai-attach
 .IP "\fC\*cc v\fR"
@@ -337,6 +345,16 @@ fetches the list of models from the server and prompts for one, with
 completion. If the list cannot be fetched any name may be typed. The model is
 saved in the registry, so it is remembered by later sessions; when no model has
 been set the first request prompts for one.
+.PP
+.B ai-set-effort
+sets how hard a reasoning model thinks before it replies, sent as the
+\fCreasoning_effort\fR of the request. It prompts with completion from
+\fB%ai-efforts\fR, though any value the server takes may be typed; more effort
+gives a more careful reply that is slower and costs more. An empty effort, the
+default, is not sent, leaving it to the model, which a model that does not
+reason needs as it may refuse the request otherwise. The effort is saved in the
+registry like the model and is shown in the message line while a request is
+sent.
 .SH CONFIGURATION
 The following variables may be set in the user's \fIuser\fR.emf setup file:
 .IP \fB%ai-base-url\fR
@@ -348,6 +366,15 @@ key.
 .IP \fB%ai-model\fR
 The model, normally set with
 .BR ai-set-model .
+.IP \fB%ai-effort\fR
+The reasoning effort, normally set with
+.BR ai-set-effort ,
+empty to leave it to the model.
+.IP \fB%ai-efforts\fR
+The efforts
+.B ai-set-effort
+offers, \fC|none|minimal|low|medium|high|xhigh|\fR by default. Which of them a
+model takes depends on the model and the server.
 .IP \fB%ai-transport\fR
 \fCcurl\fR to stream the reply through \fCcurl\fR, \fChttp\fR to use the built in
 HTTP client, or empty (the default) to use \fCcurl\fR when it is found on the
