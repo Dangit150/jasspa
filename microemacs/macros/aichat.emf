@@ -296,8 +296,12 @@ define-macro ai-chat-keys
   !if &not &exi :ai-chat
     ai-chat
   !endif
-  set-mark
+  ; the list is rewritten using the mark, and may change the number of lines above the point, so
+  ; the point is kept by an alpha mark which moves with the text and the mark is set after
+  set-alpha-mark "\xac"
   ai-chat-key-header
+  !force goto-alpha-mark "\xac"
+  set-mark
   beginning-of-buffer
   ml-write "[AI: the keys are listed at the top of the chat, C-x C-x goes back]"
 !emacro
@@ -1728,7 +1732,10 @@ define-macro ai-chat
     set-variable $window-line #l5
     set-variable $window-col #l6
     !iif &len #l0  insert-string #l0
-    !force #l3 forward-delete-char
+    ; one at a time, a count would put what is deleted in the kill buffer
+    !while &gre &pdec #l3 1 0
+      !force forward-delete-char
+    !done
   !done
 !emacro
 
@@ -2794,6 +2801,60 @@ define-macro ai-ask
   set-variable #p9 &con &len #l9 0 #l8
 !emacro
 
+; set #p7 to file or buffer and #p8 to the name the current buffer is attached by: its file,
+; unless it has none or it names a directory, as the output of a command such as *svn-diff* or
+; *grep* does
+0 define-macro ai-buffer-source
+  set-variable #l1 $buffer-fname
+  set-variable #p7 "buffer"
+  set-variable #p8 $buffer-bname
+  !iif &not &len #l1  !return
+  !iif &seq &rig #l1 &sub &len #l1 1 "/"  !return
+  !iif &seq &stat "t" #l1 "D"  !return
+  set-variable #p7 "file"
+  set-variable #p8 #l1
+!emacro
+
+; set #p1 & #p2 to the first & last line of the changes to one file at the point of the diff in the
+; current buffer, from its Index: or diff line, else its --- line, #p9 is 0 when there are none.
+; The point is not moved
+0 define-macro ai-diff-section
+  set-variable #p9 0
+  0xc0 set-position "\xa6"
+  set-variable #l1 $window-line
+  ; the line each file's changes start with
+  beginning-of-buffer
+  set-variable #l3 "^\\(Index: \\|diff \\)"
+  !force search-buffer "me" #l3
+  !iif &not $status  set-variable #l3 "^--- "
+  set-variable $window-line #l1
+  end-of-line
+  !force search-buffer "bme" #l3
+  !if &not $status
+    0xc0 goto-position "\xa6"
+    !return
+  !endif
+  set-variable #l4 $window-line
+  set-variable #l5 $window-aline
+  set-variable $window-line #l1
+  end-of-line
+  !force search-buffer "me" #l3
+  !if $status
+    backward-line
+  !else
+    end-of-buffer
+    backward-line
+  !endif
+  ; without the blank lines and the note of how the command ended
+  !while &and &gre $window-line #l4 &xse @wl "\\([ \t]*\\|\\[\\*\\*\\*\\*.*\\)"
+    backward-line
+  !done
+  set-variable #p1 #l5
+  set-variable #p2 $window-aline
+  set-variable #p9 1
+  0xc0 goto-position "\xa6"
+!emacro
+
 ; attach file @1 to the question being written in the current chat
 0 define-macro ai-attach-file
   set-variable #l1 &stat "a" @1
@@ -2831,8 +2892,9 @@ define-macro ai-attach
     goto-alpha-mark "\xa7"
     !return
   !endif
-  set-variable #l5 &con &len $buffer-fname "file" "buffer"
-  set-variable #l6 &con &len $buffer-fname $buffer-fname $buffer-bname
+  ai-buffer-source
+  set-variable #l5 #l7
+  set-variable #l6 #l8
   set-variable #l7 0
   set-variable #l8 0
   set-variable #l0 ""
@@ -2867,6 +2929,17 @@ define-macro ai-attach
       set-variable #l8 $window-aline
       !iif &les #l8 #l7  set-variable #l8 #l7
       0xc0 goto-position "\xa6"
+    !elif &seq $buffer-major-mode "diff"
+      ; a diff, such as *svn-diff*, is attached by the changes to one of its files
+      !if &iseq @mc1 "Attach the changes to the file at the point or the whole diff (f/w)? " "fFwW" "f"
+        ai-diff-section
+        !if #l9
+          set-variable #l7 #l1
+          set-variable #l8 #l2
+        !else
+          set-variable #l0 ", no file's changes found here"
+        !endif
+      !endif
     !elif &iseq @mc1 "Attach the function at the point or the whole file (f/w)? " "fFwW" "f"
       ai-function-lines
       !if #l9
@@ -2975,7 +3048,8 @@ define-macro ai-code-action
     !abort
   !endif
   !force set-variable #l6 @1
-  !iif &not $status  set-variable #l6 @ml09 &con #l9 "AI action or question on the region" "AI action or question on the buffer" %ai-actions
+  ; the actions are the prompt's history, up and down, as completion would take a space typed
+  !iif &not $status  set-variable #l6 @ml0b &con #l9 "AI question or action (up for actions) on the region" "AI question or action (up for actions) on the buffer" %ai-actions
   !if &seq #l6 ""
     goto-position "\xa1"
     !abort
@@ -2985,8 +3059,7 @@ define-macro ai-code-action
   !iif &and &not #l9 &sin "complete" #l6  set-variable #l6 &cat #l6 " As the whole file is attached, reply with edit blocks for the changes instead of the complete code."
   set-variable .ai-insert-block.src $buffer-bname
   set-variable .ai-insert-block.src-region #l9
-  set-variable #l7 &con &len $buffer-fname "file" "buffer"
-  set-variable #l8 &con &len $buffer-fname $buffer-fname $buffer-bname
+  ai-buffer-source
   ; the code is attached, not copied into the chat. A region goes as whole lines, so
   ; marks \xa2 & \xa3 that ai-insert-block replaces between are put on whole lines
   !if #l9
@@ -3110,6 +3183,8 @@ define-macro ai-insert-block
   !endif
   set-variable $system &bor #l5 0x800000
   yank
+  ; the block was only copied to be put here
+  -1 yank
   set-variable $system #l5
   !iif &seq #l4 "r"  set-alpha-mark "\xa3"
   ml-write &spr "[AI: code block %s]" &con &seq #l4 "r" "replaced the region" "inserted"
@@ -4248,7 +4323,12 @@ define-macro ai-review-edits
         !endif
         !if &not &seq #l3 #l4
           beginning-of-line
-          !iif &len #l3  &len #l3 forward-delete-char
+          ; one at a time, a count would put what is deleted in the kill buffer. #l1, the
+          ; buffer's name, is not needed again
+          set-variable #l1 &len #l3
+          !while &gre &pdec #l1 1 0
+            forward-delete-char
+          !done
           insert-string #l4
         !endif
       !endif
@@ -4943,8 +5023,9 @@ define-macro ai-edit
       !abort
     !endif
   !else
-    set-variable #l5 &con &len $buffer-fname "file" "buffer"
-    set-variable #l6 &con &len $buffer-fname $buffer-fname $buffer-bname
+    ai-buffer-source
+    set-variable #l5 #l7
+    set-variable #l6 #l8
     set-variable #l7 0
     set-variable #l8 0
     ai-get-region
@@ -4961,15 +5042,20 @@ define-macro ai-edit
   ; the quote, offered from the clipboard or the last copy
   !force set-variable #l1 @1
   !if &not $status
+    ; the clipboard is fetched into the kill buffer to read it, then taken out again
+    !force set-variable #l3 @y
+    !iif &not $status  set-variable #l3 "\x01"
     !force -98 yank
     !force set-variable #l1 @y
     !iif &not $status  set-variable #l1 ""
+    !iif &not &seq #l1 #l3  !force -1 yank
     !iif &sin "\n" #l1  set-variable #l1 &lef #l1 &sub &sin "\n" #l1 1
     set-variable #l1 @ml20 "Text to quote, e.g. the message (empty for none)" &trb #l1
   !endif
   ; how to change it, or a template, which may ask for the user's words in place of its %s
   !force set-variable #l2 @2
-  !iif &not $status  set-variable #l2 @ml09 "How should it change (or a template)" %ai-edit-actions
+  ; the templates are the prompt's history, up and down, as completion would take a space typed
+  !iif &not $status  set-variable #l2 @ml0b "How should it change (up for templates)" %ai-edit-actions
   !iif &seq #l2 ""  !abort
   !if &lfind %ai-edit-actions #l2
     set-variable #l3 &ind &cat "%ai-edit-action-" #l2

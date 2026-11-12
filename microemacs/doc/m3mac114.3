@@ -320,8 +320,8 @@ cursor where it was while the reply appears in the chat window.
 sends code from the current buffer with an instruction. The code is the lines of
 the active region, or the whole buffer when there is none, and is attached to
 the question rather than copied into the chat, together with anything already
-attached to a question that has not been written yet. The user is prompted for one of the actions listed in
-\fB%ai-actions\fR, with completion, or may type any other question instead. The
+attached to a question that has not been written yet. The user is prompted for a question, or one of the
+actions listed in \fB%ai-actions\fR, which are offered as the prompt's history with the up and down keys. The
 actions are listed below. For an action that asks for the complete code, the
 model is asked for edit blocks instead when the whole buffer is sent. The
 actions are:
@@ -371,7 +371,17 @@ otherwise it asks whether to attach the function around the cursor, found with
 the patterns the major mode uses to collapse functions and taking in the
 comment above it, or the whole file. Where the mode has none, or the cursor is
 not in a function, the lines around the cursor are attached.
+.BU
+in a diff, such as \fC*svn-diff*\fR, it asks instead whether to attach the
+changes to the file at the cursor, from its \fCIndex:\fR or \fCdiff\fR line, or
+the whole diff.
 .BE
+A buffer that holds the output of a command, such as \fC*svn-diff*\fR or
+\fC*grep*\fR, has its directory as its file name, so it is attached as a
+buffer; this also goes for
+.B ai-code-action
+and
+.BR ai-edit .
 An attachment of a file already attached to the question is merged with any
 ranges it overlaps or touches, or replaces them when it is the whole file.
 Attaching again is also how a range is moved after the file has been edited.
@@ -478,7 +488,7 @@ the system clipboard or the kill buffer, so a message copied from the code only
 needs \fCRETURN\fR. Clearing it leaves the question without a quote.
 .BU
 how it should change. This is either typed, or the name of a template from
-\fB%ai-edit-actions\fR, with completion. A template whose text holds \fC%s\fR
+\fB%ai-edit-actions\fR, which are offered as the prompt's history with the up and down keys. A template whose text holds \fC%s\fR
 then prompts for the words to put there.
 .BE
 The question is added to the chat and sent, and once the reply is in, when it
