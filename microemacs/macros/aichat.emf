@@ -9,9 +9,13 @@
 ; Authors:  Dangit
 ;
 ; The conversation is the text of the *ai-chat* buffer, split into sections by
-; "## You", "## AI" and "## System" lines, so it may be edited, saved and
-; reloaded. Requests stream through curl when it is found, otherwise they use
-; the built-in HTTP client which waits for the whole reply.
+; "## You", "## AI", "## System" and "## Tool" lines, so it may be edited, saved and
+; reloaded. Requests use the chat completions or the responses API, and stream
+; through curl when it is found, otherwise they use the built-in HTTP client which
+; waits for the whole reply. Questions may attach files, buffers and the output of
+; commands; replies may change files with edit blocks or diffs, reviewed one at a
+; time or as one diff, and with %ai-tools may ask to read and search the project.
+; Chats are saved in %ai-chat-dir.
 ;
 !iif &not &exi %ai-base-url       set-variable %ai-base-url "https://api.openai.com/v1"
 !iif &not &exi %ai-model          set-variable %ai-model &reg "/history/ai-chat/model" ""
@@ -20,7 +24,21 @@
 !iif &not &exi %ai-api-key        set-variable %ai-api-key ""
 !iif &not &exi %ai-transport      set-variable %ai-transport ""
 !iif &not &exi %ai-curl           set-variable %ai-curl "curl"
+!iif &not &exi %ai-curl-args      set-variable %ai-curl-args ""
+; the seconds a reply may go without sending anything, the built-in client takes its limit from
+; %sock-recv-timeout when its first URL is loaded
+!iif &not &exi %ai-timeout        set-variable %ai-timeout 600
+!iif &not &exi %sock-recv-timeout set-variable %sock-recv-timeout %ai-timeout
+!iif &not &exi %ai-retries        set-variable %ai-retries 2
+!iif &not &exi %ai-retry-wait     set-variable %ai-retry-wait 5
+!iif &not &exi %ai-api            set-variable %ai-api "chat"
+!iif &not &exi %ai-extra-json     set-variable %ai-extra-json ""
+!iif &not &exi %ai-tools          set-variable %ai-tools 0
+!iif &not &exi %ai-tool-rounds    set-variable %ai-tool-rounds 10
 !iif &not &exi %ai-wrap           set-variable %ai-wrap 1
+!iif &not &exi %ai-usage          set-variable %ai-usage 1
+!iif &not &exi %ai-reasoning      set-variable %ai-reasoning 0
+!iif &not &exi %ai-model-skip     set-variable %ai-model-skip "embed\\|tts\\|whisper\\|dall-e\\|image\\|moderation\\|transcri\\|realtime\\|audio\\|davinci\\|babbage\\|sora"
 !iif &not &exi %ai-system-prompt  set-variable %ai-system-prompt "You are a programming assistant inside the MicroEmacs text editor. Be concise. Put code in fenced Markdown blocks tagged with the language. When asked to change code, reply with the complete replacement in a single block."
 !iif &not &exi %ai-actions        set-variable %ai-actions "|explain|review|fix|document|tests|simplify|"
 !iif &not &exi %ai-action-explain   set-variable %ai-action-explain "Explain what this code does."
@@ -30,18 +48,32 @@
 !iif &not &exi %ai-action-tests     set-variable %ai-action-tests "Write unit tests for this code."
 !iif &not &exi %ai-action-simplify  set-variable %ai-action-simplify "Simplify this code without changing its behaviour. Reply with the complete code in one block."
 !iif &not &exi %ai-attach-max     set-variable %ai-attach-max 200000
+; the size of request, in characters, that is asked about before it is sent
+!iif &not &exi %ai-request-max    set-variable %ai-request-max %ai-attach-max
+!iif &not &exi %ai-chat-save      set-variable %ai-chat-save 1
+!iif &not &exi %ai-chat-dir       set-variable %ai-chat-dir &cat $user-path "aichat/"
 !iif &not &exi %ai-attach-lines   set-variable %ai-attach-lines 30
+!iif &not &exi %ai-attach-cmd-lines  set-variable %ai-attach-cmd-lines 2000
 !iif &not &exi %ai-edit-review    set-variable %ai-edit-review 1
+!iif &not &exi %ai-edit-lenient   set-variable %ai-edit-lenient 1
 !iif &not &exi %ai-edit-actions   set-variable %ai-edit-actions "|message|"
 !iif &not &exi %ai-edit-action-message  set-variable %ai-edit-action-message "Rewrite the message quoted above, which comes from the attached code, as follows: %s. It may be a format string, so keep its % formats matching the arguments, and change every place it is used."
 !iif &not &exi %ai-edit-prompt    set-variable %ai-edit-prompt "To change an attached file reply with edit blocks rather than the whole file. An edit block is a fenced block whose info string is edit followed by the file's name from its attachment, holding one or more changes:\n```edit src/main.c\n<<<<<<< SEARCH\nlines copied exactly from the file\n=======\nthe lines that replace them\n>>>>>>> REPLACE\n```\nCopy the SEARCH lines exactly, indentation included, using just enough lines to match one place in the file. Give each place that changes its own SEARCH and REPLACE, in the order they come in the file. An empty SEARCH creates a new file. Explain the changes briefly outside the blocks."
 ; an attachment line, for &xse
-set-variable %ai-att-line "@\\(file\\|buffer\\)[ \t]+\\(.*[^ \t\n]\\)[ \t]*"
-; an edit block's opening fence and, for &xse, the status line written after it for each change
-set-variable %ai-edit-fence "^[ \t]*\\(```+\\)[ \t]*edit[ \t]+\\(.*[^ \t\n]\\)[ \t]*$"
+set-variable %ai-att-line "@\\(file\\|buffer\\|cmd\\|diff\\|tree\\)[ \t]+\\(.*[^ \t\n]\\)[ \t]*"
+; for &xse, a role line, which may end in a comment such as the model that wrote a reply, and a
+; tool's result is for the call named in its role line
+set-variable %ai-role-re "## \\(You\\|AI\\|System\\|Tool[ \t]+[-_.:A-Za-z0-9]+\\)\\([ \t]+<!--.*-->\\)?[ \t]*"
+set-variable %ai-you-re "## You\\([ \t]+<!--.*-->\\)?[ \t]*"
+set-variable %ai-ai-re "## AI\\([ \t]+<!--.*-->\\)?[ \t]*"
+; an edit block's opening fence, the file's name may follow edit after a space, : or =, and for
+; &xse the same giving the fence and name as @s1 & @s3. The status line written after it for each
+; change
+set-variable %ai-edit-fence "^[ \t]*\\(```+\\|~~~+\\)[ \t]*edit\\([ \t]*[:=][ \t]*\\|[ \t]+\\)[^ \t\n].*$"
+set-variable %ai-edit-fence-x "[ \t]*\\(```+\\|~~~+\\)[ \t]*edit\\([ \t]*[:=][ \t]*\\|[ \t]+\\)\\(.*[^ \t\n]\\)[ \t]*"
 set-variable %ai-edit-status "(edit [0-9]+ [a-z]+.*"
 ; a role line, a code fence or an attachment line, the lines that give a chat its structure
-set-variable %ai-map-regex "^\\(## \\(You\\|AI\\|System\\)[ \t]*\\|[ \t]*\\(```\\|~~~\\).*\\|@\\(file\\|buffer\\)[ \t]+.*[^ \t\n][ \t]*\\)$"
+set-variable %ai-map-regex &spr "^\\(%s\\|[ \t]*\\(```\\|~~~\\).*\\|%s\\)$" %ai-role-re %ai-att-line
 set-variable %ai-fence-regex "^[ \t]*\\(```\\|~~~\\)"
 set-variable %ai-busy 0
 set-variable %ai-spaces "                                                                "
@@ -52,10 +84,150 @@ set-variable %ai-hdr-file ""
 set-variable %ai-req-note ""
 set-variable %ai-edit-review-next 0
 set-variable %ai-undo-new 0
+set-variable %ai-key-list 0
+!iif &not &exi %ai-chat-buf  set-variable %ai-chat-buf "*ai-chat*"
+set-variable %ai-insert-next 0
+set-variable %ai-retry-at 0
+set-variable %ai-req-key ""
+set-variable %ai-req-resp 0
+set-variable %ai-tc-n 0
+set-variable %ai-think 0
+set-variable %ai-ml-saved ""
+set-variable %ai-tool-round 0
+set-variable %ai-key-cmd ""
+set-variable %ai-edit-decide ""
+set-variable %ai-edit-reject-this 0
+set-variable %ai-att-into "*ai-req*"
+!iif &not &exi %ai-commit-prompt  set-variable %ai-commit-prompt "Write a git commit message for the staged changes in the diff above: a summary line of at most 72 characters, a blank line, then a short body saying what changed and why, wrapped at 72 columns. Reply with only the message in a single text code block."
+!iif &not &exi %ai-fix-prompt     set-variable %ai-fix-prompt "Fix the cause of this error in the attached code, replying with edit blocks."
+!iif &not &exi %ai-models-url     set-variable %ai-models-url ""
+!iif &not &exi %ai-api-key-command  set-variable %ai-api-key-command ""
+!iif &not &exi %ai-profiles       set-variable %ai-profiles "|"
+set-variable %ai-profile-settings "|base-url|api-key|api-key-command|transport|api|extra-json|tools|"
+; the default profile, the settings as they were given before this file was loaded
+!iif &not &exi %ai-default-base-url  set-variable %ai-default-base-url %ai-base-url
+!iif &not &exi %ai-default-api-key   set-variable %ai-default-api-key %ai-api-key
+!iif &not &exi %ai-default-api-key-command  set-variable %ai-default-api-key-command %ai-api-key-command
+!iif &not &exi %ai-default-transport  set-variable %ai-default-transport %ai-transport
+!iif &not &exi %ai-default-api       set-variable %ai-default-api %ai-api
+!iif &not &exi %ai-default-extra-json  set-variable %ai-default-extra-json %ai-extra-json
+!iif &not &exi %ai-default-tools     set-variable %ai-default-tools %ai-tools
+!iif &not &exi %ai-default-model     set-variable %ai-default-model %ai-model
+!iif &not &exi %ai-default-effort    set-variable %ai-default-effort %ai-effort
 
+; set #p9 to the API key: %ai-api-key, else the first line written by %ai-api-key-command, run
+; once until the command or profile changes, else the OPENAI_API_KEY environment variable
 0 define-macro ai-get-key
   set-variable #p9 %ai-api-key
-  !iif &seq #p9 ""  set-variable #p9 &con &seq $OPENAI_API_KEY "ERROR" "" $OPENAI_API_KEY
+  !iif &not &seq #p9 ""  !return
+  !if &len %ai-api-key-command
+    !if &not &seq %ai-key-cmd %ai-api-key-command
+      set-variable %ai-key-out ""
+      !force 0x402 pipe-shell-command %ai-api-key-command "%ai-key-out"
+      set-variable #l1 $result
+      set-variable #l2 %ai-key-out
+      !iif &sin "\n" #l2  set-variable #l2 &lef #l2 &sub &sin "\n" #l2 1
+      set-variable #l2 &trb &rep #l2 "\r" ""
+      set-variable %ai-key-out ""
+      !if &or #l1 &seq #l2 ""
+        ml-write &spr "[AI Error: the key command %s failed]" %ai-api-key-command
+        !abort
+      !endif
+      set-variable %ai-key-cache #l2
+      set-variable %ai-key-cmd %ai-api-key-command
+    !endif
+    set-variable #p9 %ai-key-cache
+    !return
+  !endif
+  set-variable #p9 &con &seq $OPENAI_API_KEY "ERROR" "" $OPENAI_API_KEY
+!emacro
+
+; Profiles: a profile is a server and how it is used, given by %ai-profile-NAME-SETTING for each
+; setting in %ai-profile-settings. A setting a profile does not give has its value from when this
+; file was loaded, which is the default profile. The model and effort last chosen are kept for
+; each profile
+
+; set #p9 to where setting @1 (model or effort) of the current profile is kept in the registry
+0 define-macro ai-profile-reg
+  set-variable #l1 @1
+  set-variable #p9 &con &seq %ai-profile "default" &spr "/history/ai-chat/%s" #l1 &spr "/history/ai-chat/profile-%s/%s" %ai-profile #l1
+!emacro
+
+; keep value @2 of setting @1 (model or effort) of the current profile in the registry
+0 define-macro ai-profile-keep
+  set-variable #l1 @1
+  set-variable #l2 @2
+  ai-profile-reg #l1
+  !if &not &seq #l2 &reg #l9 ""
+    set-registry #l9 #l2
+    ; set-registry does not flag the history as changed, so it would not be saved
+    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
+  !endif
+!emacro
+
+; set the %ai- variables from the profile %ai-profile
+0 define-macro ai-profile-apply
+  set-variable #l1 %ai-profile
+  set-variable #l2 0
+  !while &not &seq &set #l3 &lget %ai-profile-settings &inc #l2 1 ""
+    set-variable #l4 &spr "%%ai-profile-%s-%s" #l1 #l3
+    !if &and &not &seq #l1 "default" &exi #l4
+      set-variable &ind &spr "%%ai-%s" #l3 &ind #l4
+    !else
+      set-variable &ind &spr "%%ai-%s" #l3 &ind &spr "%%ai-default-%s" #l3
+    !endif
+  !done
+  ; the model and effort last used with it, else its own
+  ai-profile-reg "model"
+  set-variable #l5 &reg #l9 ""
+  !if &seq #l5 ""
+    set-variable #l5 &con &seq #l1 "default" %ai-default-model ""
+    !iif &exi &spr "%%ai-profile-%s-model" #l1  set-variable #l5 &ind &spr "%%ai-profile-%s-model" #l1
+  !endif
+  set-variable %ai-model #l5
+  ai-profile-reg "effort"
+  set-variable #l5 &reg #l9 "\x01"
+  !if &seq #l5 "\x01"
+    set-variable #l5 &con &seq #l1 "default" %ai-default-effort ""
+    !iif &exi &spr "%%ai-profile-%s-effort" #l1  set-variable #l5 &ind &spr "%%ai-profile-%s-effort" #l1
+  !endif
+  set-variable %ai-effort #l5
+  set-variable %ai-key-cmd ""
+!emacro
+
+; choose the profile, from "default" and %ai-profiles
+define-macro ai-set-profile
+  !force set-variable #l1 @1
+  !if &not $status
+    !if &les &len %ai-profiles 2
+      ml-write "[AI: there are no profiles, see %ai-profiles]"
+      !abort
+    !endif
+    !force set-variable #l1 @ml29 "AI profile" %ai-profile &cat "|default" %ai-profiles
+    !iif &not $status  !abort
+  !endif
+  set-variable #l1 &trb #l1
+  !iif &seq #l1 ""  set-variable #l1 "default"
+  !if &not &or &seq #l1 "default" &lfind %ai-profiles #l1
+    ml-write &spr "[AI: there is no profile %s in %%ai-profiles]" #l1
+    !abort
+  !endif
+  ; leaving the default profile keeps its settings as they are now
+  !if &seq %ai-profile "default"
+    set-variable #l2 0
+    !while &not &seq &set #l3 &lget %ai-profile-settings &inc #l2 1 ""
+      set-variable &ind &spr "%%ai-default-%s" #l3 &ind &spr "%%ai-%s" #l3
+    !done
+    set-variable %ai-default-model %ai-model
+    set-variable %ai-default-effort %ai-effort
+  !endif
+  set-variable %ai-profile #l1
+  ai-profile-apply
+  !if &not &seq #l1 &reg "/history/ai-chat/profile" "default"
+    set-registry "/history/ai-chat/profile" #l1
+    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
+  !endif
+  ml-write &spr "[AI: using profile %s, model %s%s]" #l1 &con &len %ai-model %ai-model "not set" &con &len %ai-effort &spr ", %s effort" %ai-effort ""
 !emacro
 
 0 define-macro ai-temp-buffer
@@ -74,16 +246,130 @@ set-variable %ai-undo-new 0
   set-alpha-mark "\xa4"
 !emacro
 
+; the keys of a chat buffer, bound by ai-chat-buffer and listed at the top of a chat by
+; ai-chat-key-list, each with the text that says what it does
+0 define-macro ai-chat-key-table
+  ai-chat-key "C-c C-c" ai-send "send"
+  ai-chat-key "C-c C-k" ai-cancel "cancel"
+  ai-chat-key "C-c g" ai-retry "ask again"
+  ai-chat-key "C-c f" ai-attach "attach files"
+  ai-chat-key "C-c v" ai-show-attachment "show attachment"
+  ai-chat-key "C-c q" ai-quote "quote region"
+  ai-chat-key "C-c e" ai-edit "ask for a change"
+  ai-chat-key "C-c a" ai-apply-edits "apply edits"
+  ai-chat-key "C-c d" ai-review-edits "review edits"
+  ai-chat-key "C-c u" ai-undo-edits "undo edits"
+  ai-chat-key "C-c i" ai-insert-block "insert block"
+  ai-chat-key "C-c m" ai-set-model "model"
+  ai-chat-key "C-c r" ai-set-effort "effort"
+  ai-chat-key "C-c p" ai-set-profile "profile"
+  ai-chat-key "C-c n" ai-new "new chat"
+  ai-chat-key "C-c o" ai-chat-open "open chat"
+  ai-chat-key "C-c b" ai-fork "branch chat"
+  ai-chat-key "C-c C-n" ai-next-part "next part"
+  ai-chat-key "C-c C-p" ai-prev-part "previous part"
+  ai-chat-key "C-c C-f" ai-next-block "next block"
+  ai-chat-key "C-c C-b" ai-prev-block "previous block"
+  ai-chat-key "C-c tab" ai-fold "fold part"
+  ai-chat-key "C-c ?" ai-chat-keys "these keys"
+!emacro
+
+; bind key @1 to @2 in the current buffer, or with %ai-key-list add it to the list in *ai-keys*
+0 define-macro ai-chat-key
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  !if &not %ai-key-list
+    buffer-bind-key #l2 #l1
+    !return
+  !endif
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-keys*"
+  set-variable #l4 &cat &cat #l1 &lef %ai-spaces &sub 8 &len #l1 #l3
+  !if &equ %ai-key-list 3
+    insert-string &cat #l4 "\n"
+    set-variable %ai-key-list 1
+  !else
+    insert-string &cat #l4 &lef %ai-spaces &sub 25 &len #l4
+    set-variable %ai-key-list &add %ai-key-list 1
+  !endif
+  find-buffer #l0
+!emacro
+
+; the comment at the top of a chat, listing its keys three to a line
+0 define-macro ai-chat-key-list
+  set-variable #l0 $buffer-bname
+  ai-temp-buffer "*ai-keys*"
+  insert-string "<!-- AI chat: write under the last \"## You\" line, then C-c C-c to send.\n"
+  find-buffer #l0
+  set-variable %ai-key-list 1
+  ai-chat-key-table
+  set-variable %ai-key-list 0
+  find-buffer "*ai-keys*"
+  ; end the last line and the comment
+  end-of-buffer
+  !iif &gre $window-col 0  insert-string "\n"
+  set-variable #l1 1
+  beginning-of-buffer
+  !while &not &seq @wc ""
+    end-of-line
+    !while &and &gre $window-col 0 &seq &set #l2 &mid @wl &sub $window-col 1 1 " "
+      backward-delete-char
+    !done
+    forward-line
+  !done
+  insert-string "-->\n"
+  find-buffer #l0
+!emacro
+
+; replace the key list comment at the top of the current chat with one for the current keys, or
+; add one when there is none
+0 define-macro ai-chat-key-header
+  ai-chat-key-list
+  beginning-of-buffer
+  !if &xse @wl "<!-- AI chat.*"
+    set-mark
+    !force search-buffer "Me" "-->"
+    !if $status
+      forward-line
+      beginning-of-line
+      -1 kill-region
+    !else
+      beginning-of-buffer
+    !endif
+  !endif
+  ai-edit-append-at 1 "*ai-keys*"
+  !force 0 delete-buffer "*ai-keys*"
+!emacro
+
+; list the chat's keys at the top of the chat, the point is left there with the mark where it was
+define-macro ai-chat-keys
+  !if &not &exi :ai-chat
+    ai-chat
+  !endif
+  set-mark
+  ai-chat-key-header
+  beginning-of-buffer
+  ml-write "[AI: the keys are listed at the top of the chat, C-x C-x goes back]"
+!emacro
+
 0 define-macro ai-chat-init
   beginning-of-buffer
   set-mark
   end-of-buffer
   !force -1 kill-region
-  insert-string "<!-- AI chat: write under a \"## You\" line, then C-c C-c to send. -->\n\n## You\n\n"
+  ai-chat-key-header
+  end-of-buffer
+  insert-string "\n## You\n\n"
 !emacro
 
 0 define-macro ai-chat-buffer
-  find-buffer "*ai-chat*"
+  find-buffer %ai-chat-buf
+  ai-chat-setup
+!emacro
+
+; make the current buffer a chat
+0 define-macro ai-chat-setup
   !if &not &exi :ai-chat
     ; markdown fills an empty buffer with its file template
     !iif &les $window-eline 2  ai-chat-init
@@ -101,17 +387,8 @@ set-variable %ai-undo-new 0
       set-variable $buffer-hilight .hilight.aichat
     !endif
     set-variable :ai-chat 1
-    buffer-bind-key ai-send "C-c C-c"
-    buffer-bind-key ai-cancel "C-c C-k"
-    buffer-bind-key ai-insert-block "C-c i"
-    buffer-bind-key ai-new "C-c n"
-    buffer-bind-key ai-set-model "C-c m"
-    buffer-bind-key ai-set-effort "C-c r"
-    buffer-bind-key ai-attach "C-c f"
-    buffer-bind-key ai-show-attachment "C-c v"
-    buffer-bind-key ai-apply-edits "C-c a"
-    buffer-bind-key ai-undo-edits "C-c u"
-    buffer-bind-key ai-edit "C-c e"
+    set-variable %ai-key-list 0
+    ai-chat-key-table
   !endif
 !emacro
 
@@ -150,6 +427,8 @@ set-variable %ai-undo-new 0
 ; %ai-map-last is the last role line, %ai-map-open the line of a code block left open at the end
 ; and %ai-map-fence its fence, 0 and "" when there is none. The point is not moved
 0 define-macro ai-chat-map
+  ; the lines of folded parts would not be seen
+  !iif &bmo "narrow"  !force 1 narrow-buffer
   0xc0 set-position "\xa9"
   set-variable #l1 "|"
   set-variable #l2 "|"
@@ -167,7 +446,7 @@ set-variable %ai-undo-new 0
         ai-fence-line #l6 #l3
         set-variable #l3 %ai-fence
       !endif
-    !elif &xse #l6 "## \\(You\\|AI\\|System\\)[ \t]*"
+    !elif &xse #l6 %ai-role-re
       set-variable #l4 @s1
       set-variable #l7 $window-line
       set-variable #l1 &spr "%s%d|" #l1 #l7
@@ -212,7 +491,7 @@ set-variable %ai-undo-new 0
   set-variable #l1 %ai-map-last
   !if #l1
     set-variable $window-line #l1
-    set-variable #l1 &xse @wl "## You[ \t]*"
+    set-variable #l1 &xse @wl %ai-you-re
   !endif
   !if #l1
     set-variable #l1 $window-line
@@ -253,7 +532,7 @@ set-variable %ai-undo-new 0
   set-variable #l1 %ai-map-last
   !if #l1
     set-variable $window-line #l1
-    set-variable #l1 &xse @wl "## You[ \t]*"
+    set-variable #l1 &xse @wl %ai-you-re
   !endif
   !if #l1
     forward-line
@@ -344,10 +623,33 @@ set-variable %ai-undo-new 0
   set-variable #p9 #l0
 !emacro
 
+; set #p9 to a | list of the names of the open chats other than *ai-chat*
+0 define-macro ai-chat-names
+  set-variable #l0 $buffer-bname
+  set-variable $buffer-names "^\\*ai-chat\\(:.*\\)?\\*$"
+  set-variable #l1 "|"
+  !while &not &seq &set #l2 $buffer-names ""
+    !iif &gre &len #l2 10  set-variable #l1 &spr "%s%s|" #l1 &mid #l2 9 &sub &len #l2 10
+  !done
+  set-variable #p9 #l1
+!emacro
+
+; show the chat in a popup window and move to its end. With an argument it asks which chat, by
+; name, starting one when there is none of that name, empty for *ai-chat*
 define-macro ai-chat
-  !if &not &seq $buffer-bname "*ai-chat*"
-    !force 0 popup-window "*ai-chat*"
-    !iif &not $status  1 popup-window "*ai-chat*"
+  !if @?
+    ai-chat-names
+    !force set-variable #l1 @ml09 "AI chat (empty for the main chat)" #l9
+    !iif &not $status  !abort
+    set-variable #l1 &trb #l1
+    set-variable %ai-chat-buf &con &len #l1 &spr "*ai-chat:%s*" #l1 "*ai-chat*"
+  !elif &exi :ai-chat
+    ; the chat in use is the one last shown
+    set-variable %ai-chat-buf $buffer-bname
+  !endif
+  !if &not &seq $buffer-bname %ai-chat-buf
+    !force 0 popup-window %ai-chat-buf
+    !iif &not $status  1 popup-window %ai-chat-buf
   !endif
   ai-chat-buffer
   end-of-buffer
@@ -360,14 +662,18 @@ define-macro ai-chat
   set-variable #l1 @2
   set-variable #l2 0
   set-variable #l3 0
-  !if &xse #l1 "\\(.*[^ \t\n]\\)[ \t]*:\\([0-9]+\\)\\(-\\([0-9]+\\)\\)?"
+  ; only a file or buffer takes lines, a command is left as it is
+  !if &not &lfind "|file|buffer|" #l0
+  !elif &xse #l1 "\\(.*[^ \t\n]\\)[ \t]*:\\([0-9]+\\)\\(-\\([0-9]+\\)\\)?"
     set-variable #l1 @s1
     set-variable #l2 @s2
     set-variable #l3 &con &seq @s4 "" #l2 @s4
     !iif &les #l2 1  set-variable #l2 1
     !iif &les #l3 #l2  set-variable #l3 #l2
   !endif
-  !if &seq #l0 "file"
+  !if &seq #l0 "cmd"
+    set-variable #l1 &rep #l1 "\t" " "
+  !elif &not &seq #l0 "buffer"
     set-variable #l1 &stat "a" #l1
     ; a directory's absolute name ends in a /
     !iif &and &gre &len #l1 1 &seq &rig #l1 &sub &len #l1 1 "/"  set-variable #l1 &lef #l1 &sub &len #l1 1
@@ -458,23 +764,42 @@ define-macro ai-chat
       find-buffer #l0
     !endif
   !done
-  ; a file is named by the shortest end of its name that no other file ends with
+  ; a file is named by the shortest end of its name that no other file ends with, a directory
+  ; shown under the home directory
   find-buffer "*ai-att*"
   beginning-of-buffer
   set-variable #l9 0
+  set-variable #l8 0
   !while &not &seq @wc ""
     set-variable #l1 @wl
+    set-variable #l3 &lget #l1 1
     set-variable #l7 &lget #l1 2
-    !if &seq &lget #l1 1 "file"
+    !if &seq #l3 "file"
       set-variable #l2 #l7
       ai-att-label #l2
+    !elif &lfind "|diff|tree|" #l3
+      ai-home-name #l7
+      set-variable #l7 #l9
     !endif
     set-variable @wl &lset #l1 6 #l7
-    set-variable #l9 &add #l9 1
+    !iif &lfind "|file|buffer|" #l3  set-variable #l8 &add #l8 1
     forward-line
   !done
+  end-of-buffer
+  set-variable #l9 &sub $window-line 1
   find-buffer #l0
   set-variable #p9 #l9
+  set-variable #p8 #l8
+!emacro
+
+; set #p9 to file name @1 with the home directory as ~
+0 define-macro ai-home-name
+  set-variable #l1 @1
+  !if &not &seq $HOME "ERROR"
+    !iif &seq &lef #l1 &add &len $HOME 1 &cat $HOME "/"  set-variable #l1 &cat "~" &rig #l1 &len $HOME
+    !iif &seq #l1 $HOME  set-variable #l1 "~"
+  !endif
+  set-variable #p9 #l1
 !emacro
 
 ; set #p6 to the *ai-att* record of attachment @1 @2 lines @3 to @4
@@ -501,7 +826,14 @@ define-macro ai-chat
   set-variable #l4 @4
   set-variable #l7 ""
   set-variable #l8 0
-  !if &seq #l1 "buffer"
+  !if &lfind "|cmd|diff|tree|" #l1
+    ai-att-run #l1 #l2
+    find-buffer #l0
+    set-variable #p7 #l7
+    set-variable #p8 #l8
+    set-variable #p9 #l9
+    !return
+  !elif &seq #l1 "buffer"
     set-variable #l5 &con &exi &spr ":%s:" #l2 #l2 ""
     set-variable #l9 &con &len #l5 "" "there is no such buffer"
   !else
@@ -595,6 +927,137 @@ define-macro ai-chat
   set-variable #p9 #l9
 !emacro
 
+; set #p9 to "y" when command @1 may be run for an attachment of chat %ai-att-chat, asking the
+; first time in each chat
+0 define-macro ai-cmd-allowed
+  set-variable #l1 @1
+  set-variable #l2 &ind &spr ":%s:ai-cmd-ok" %ai-att-chat
+  !iif &seq #l2 "ERROR"  set-variable #l2 "\x01"
+  !if &lfind #l2 #l1
+    set-variable #p9 "y"
+    !return
+  !endif
+  !force set-variable #l9 @mc1 &spr "Run \"%s\" for its attachment (y/n)? " #l1 "yYnN"
+  !iif &not $status  set-variable #l9 "n"
+  set-variable #l9 &slo #l9
+  !iif &seq #l9 "y"  ai-cmd-allow #l1 %ai-att-chat
+  set-variable #p9 #l9
+!emacro
+
+; let command @1 be run for the attachments of chat buffer @2 without asking
+0 define-macro ai-cmd-allow
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 &ind &spr ":%s:ai-cmd-ok" #l2
+  !iif &seq #l3 "ERROR"  set-variable #l3 "\x01"
+  !iif &not &lfind #l3 #l1  set-variable &ind &spr ":%s:ai-cmd-ok" #l2 &spr "%s%s\x01" #l3 #l1
+!emacro
+
+; fill *ai-att-text* with the output of the attachment of type @1 (cmd, diff or tree) @2, run in
+; a shell. Sets #p7 to its language, #p8 to its line count and #p9 to why it was not run or "",
+; %ai-att-rc to the exit code and %ai-att-cut to the number of lines there were when cut short
+0 define-macro ai-att-run
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l0 $buffer-bname
+  set-variable #p8 0
+  set-variable #p9 ""
+  set-variable %ai-att-rc 0
+  set-variable %ai-att-cut 0
+  set-variable #p7 &con &seq #l1 "diff" "diff" "text"
+  ai-temp-buffer "*ai-att-text*"
+  find-buffer #l0
+  !if &seq #l1 "cmd"
+    ai-cmd-allowed #l2
+    !if &not &seq #l9 "y"
+      set-variable #p9 "the command was not run"
+      !return
+    !endif
+    set-variable #l3 #l2
+  !else
+    ; the name is passed in double quotes, which these characters would get out of
+    !if &or &sin "\"" #l2 &or &sin "$" #l2 &sin "`" #l2
+      set-variable #p9 "its name has a quote, $ or ` in it"
+      !return
+    !endif
+    set-variable #l4 &stat "t" #l2
+    !if &seq #l4 "D"
+      set-variable #l5 #l2
+      set-variable #l6 "."
+    !elif &seq #l1 "tree"
+      set-variable #p9 "it is not a directory"
+      !return
+    !else
+      set-variable #l5 &lef #l2 &rsin "/" #l2
+      set-variable #l6 &rig #l2 &rsin "/" #l2
+    !endif
+    !if &seq #l1 "diff"
+      set-variable #l3 &spr "git -C \"%s\" --no-pager diff --no-ext-diff --no-color HEAD -- \"%s\"" #l5 #l6
+    !else
+      set-variable #l3 &spr "git -C \"%s\" ls-files" #l5
+    !endif
+  !endif
+  !force 0x42 pipe-shell-command #l3 "*ai-att-text*"
+  set-variable %ai-att-rc $result
+  ; the output is read only
+  find-buffer "*ai-att-text*"
+  -1 buffer-mode "view"
+  1 buffer-mode "hide"
+  find-buffer #l0
+  ; a directory that is not in git is listed by the editor
+  !if &and &seq #l1 "tree" &not &equ %ai-att-rc 0
+    ai-temp-buffer "*ai-att-text*"
+    ai-att-walk #l2
+    set-variable %ai-att-rc 0
+  !endif
+  find-buffer "*ai-att-text*"
+  end-of-buffer
+  set-variable #l8 &sub $window-line 1
+  !if &gre #l8 %ai-attach-cmd-lines
+    set-variable %ai-att-cut #l8
+    set-variable $window-line &add %ai-attach-cmd-lines 1
+    set-mark
+    end-of-buffer
+    -1 kill-region
+    set-variable #l8 %ai-attach-cmd-lines
+  !endif
+  find-buffer #l0
+  set-variable #p8 #l8
+!emacro
+
+; list the files under directory @1 in the current buffer, relative to it and up to
+; %ai-attach-cmd-lines of them, leaving out those whose names start with a dot
+0 define-macro ai-att-walk
+  set-variable #l1 @1
+  set-variable #l0 $buffer-bname
+  ai-temp-buffer "*ai-att-dirs*"
+  insert-string "\n"
+  set-variable #l2 1
+  set-variable #l3 0
+  !repeat
+    find-buffer "*ai-att-dirs*"
+    set-variable $window-line #l2
+    !iif &seq @wc ""  !break
+    set-variable #l4 @wl
+    set-variable #l2 &add #l2 1
+    set-variable $file-names &spr "%s/%s.*" #l1 #l4
+    !while &not &seq &set #l5 $file-names ""
+      !if &seq &lef #l5 1 "."
+      !elif &seq &rig #l5 &sub &len #l5 1 "/"
+        find-buffer "*ai-att-dirs*"
+        end-of-buffer
+        insert-string &spr "%s%s\n" #l4 #l5
+      !elif &les #l3 %ai-attach-cmd-lines
+        find-buffer #l0
+        insert-string &spr "%s%s\n" #l4 #l5
+        set-variable #l3 &add #l3 1
+      !endif
+    !done
+  !done
+  !force 0 delete-buffer "*ai-att-dirs*"
+  find-buffer #l0
+!emacro
+
 ; note a problem with an attachment for the request message
 0 define-macro ai-att-warn
   set-variable %ai-req-bad &add %ai-req-bad 1
@@ -610,6 +1073,10 @@ define-macro ai-chat
   set-variable #l4 @4
   set-variable #l5 @5
   ai-att-find #l1 #l2 #l3 #l4
+  !if &lfind "|cmd|diff|tree|" #l1
+    ai-att-insert-run #l1 #l2 &lget #l6 6 &equ &lget #l6 5 #l5
+    !return
+  !endif
   set-variable #l0 &spr "%s %s" #l1 &lget #l6 6
   !if &not &equ &lget #l6 5 #l5
     !iif #l3  set-variable #l0 &cat #l0 &con &equ #l3 #l4 &spr " line %d" #l3 &spr " lines %d-%d" #l3 #l4
@@ -631,6 +1098,53 @@ define-macro ai-chat
   !else
     set-variable #l0 &spr "Attached %s, %d line%s:" #l0 #l8 &con &equ #l8 1 "" "s"
   !endif
+  ai-att-fenced #l0 #l7
+!emacro
+
+; insert at the point in *ai-req* the attachment of type @1 (cmd, diff or tree) @2 labelled @3,
+; its output when @4 is 1 else a pointer to its last mention
+0 define-macro ai-att-insert-run
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l4 @4
+  !if &seq #l1 "cmd"
+    set-variable #l0 &spr "The output of the command `%s`" #l3
+  !elif &seq #l1 "diff"
+    set-variable #l0 &spr "The git diff of %s" #l3
+  !else
+    set-variable #l0 &spr "The files under %s" #l3
+  !endif
+  !if &not #l4
+    insert-string &spr "(%s, as it is now, is in a later message.)" #l0
+    !return
+  !endif
+  ai-att-read #l1 #l2 0 0
+  !if &len #l9
+    insert-string &spr "(%s is not given, %s.)" #l0 #l9
+    ai-att-warn &spr "%s not sent" #l3
+    !return
+  !elif &and &not #l8 &seq #l1 "diff"
+    insert-string &spr "(%s shows no changes.)" #l0
+    set-variable %ai-req-atts &add %ai-req-atts 1
+    !return
+  !endif
+  !iif &and %ai-att-rc &seq #l1 "cmd"  set-variable #l0 &spr "%s, exit code %d" #l0 %ai-att-rc
+  !if %ai-att-cut
+    set-variable #l0 &spr "%s, the first %d of its %d lines:" #l0 #l8 %ai-att-cut
+  !elif &seq #l1 "tree"
+    set-variable #l0 &spr "%s, %d file%s:" #l0 #l8 &con &equ #l8 1 "" "s"
+  !else
+    set-variable #l0 &spr "%s, %d line%s:" #l0 #l8 &con &equ #l8 1 "" "s"
+  !endif
+  ai-att-fenced #l0 #l7
+!emacro
+
+; insert at the point in *ai-req* the text of *ai-att-text* in a code block of language @2 after
+; the line @1
+0 define-macro ai-att-fenced
+  set-variable #l0 @1
+  set-variable #l7 @2
   find-buffer "*ai-att-text*"
   ; fence it with more backticks than any fence in the text
   set-variable #l3 3
@@ -651,7 +1165,7 @@ define-macro ai-chat
   set-variable #l6 $system
   set-variable $system &bor #l6 0x800000
   copy-region
-  find-buffer "*ai-req*"
+  find-buffer %ai-att-into
   !force yank
   -1 yank
   set-variable $system #l6
@@ -694,11 +1208,22 @@ define-macro ai-chat
   backward-char
 !emacro
 
-; JSON request building, the text of a message is inserted at the end of *ai-req*
-; between ai-req-open and ai-req-close
+; JSON request building, the text of a message is inserted at the end of *ai-req* between
+; ai-req-open and ai-req-close. %ai-req-n counts the messages so far and %ai-req-mline & mcol are
+; where the current one starts, so it can be dropped. Role @1 is user, assistant, system or tool,
+; a tool's result being for call @2
 0 define-macro ai-req-open
   end-of-buffer
-  insert-string &spr "%s{\"role\":\"%s\",\"content\":\"" @2 @1
+  set-variable %ai-req-mline $window-line
+  set-variable %ai-req-mcol $window-col
+  !iif %ai-req-n  insert-string ","
+  !if &not &seq @1 "tool"
+    insert-string &spr "{\"role\":\"%s\",\"content\":\"" @1
+  !elif %ai-req-resp
+    insert-string &spr "{\"type\":\"function_call_output\",\"call_id\":\"%s\",\"output\":\"" @2
+  !else
+    insert-string &spr "{\"role\":\"tool\",\"tool_call_id\":\"%s\",\"content\":\"" @2
+  !endif
   set-variable %ai-req-line $window-line
   set-variable %ai-req-col $window-col
 !emacro
@@ -707,6 +1232,16 @@ define-macro ai-chat
 0 define-macro ai-req-close
   ai-req-escape
   insert-string "\"}"
+  set-variable %ai-req-n &add %ai-req-n 1
+!emacro
+
+; drop the message started by ai-req-open
+0 define-macro ai-req-drop
+  set-variable $window-line %ai-req-mline
+  set-variable $window-col %ai-req-mcol
+  set-mark
+  end-of-buffer
+  -1 kill-region
 !emacro
 
 ; escape the text from %ai-req-line & %ai-req-col to the point for a JSON string and join its lines,
@@ -743,93 +1278,440 @@ define-macro ai-chat
   end-of-line
 !emacro
 
-; copy the trimmed lines @3 to @4 (exclusive) of chat buffer @1 as a message for role @2
+; set #p9 to the file named by line of text @1 written above a code block, as a model may name
+; the file a block of SEARCH and REPLACE changes is for, else ""
+0 define-macro ai-name-above
+  set-variable #l1 &trb @1
+  set-variable #p9 ""
+  !iif &xse #l1 "\\(#+\\|[-*]\\)[ \t]+\\(.*\\)"  set-variable #l1 &trb @s2
+  !iif &xse #l1 "\\(file\\|filename\\|path\\)[ \t]*:[ \t]*\\(.*\\)"  set-variable #l1 &trb @s2
+  ; bold, quotes and a trailing colon around it
+  !while &and &len #l1 &sin &lef #l1 1 "*`\"'"
+    set-variable #l1 &rig #l1 1
+  !done
+  !while &and &len #l1 &sin &rig #l1 &sub &len #l1 1 "*`\"':"
+    set-variable #l1 &lef #l1 &sub &len #l1 1
+  !done
+  !iif &not &xse #l1 "[^ \t*`\"']*[./][^ \t*`\"']*"  !return
+  ; not a sentence's end or a number
+  !iif &xse #l1 "[0-9.]*"  !return
+  !iif &seq &rig #l1 &sub &len #l1 1 "."  !return
+  set-variable #p9 #l1
+!emacro
+
+; tidy the text of a reply just added to *ai-req*, from %ai-req-line & %ai-req-col to its end:
+; the editor's notes and thinking blocks are removed, the status lines written after edit blocks
+; are moved to *ai-req-st* to be reported in the next question, and the tool-call blocks are moved
+; to *ai-req-tc* as a header line of call id, name and line count then its arguments. The point is
+; left at the end of the text
+0 define-macro ai-req-reply
+  set-variable $window-line %ai-req-line
+  set-variable $window-col %ai-req-col
+  ; put the text on its own lines so its first line is seen
+  insert-string "\n"
+  ; #l1 the open fence, #l3 its line, #l4 what it holds, #l2 the name of the last block of changes
+  set-variable #l1 ""
+  set-variable #l2 "block"
+  set-variable #l4 ""
+  set-variable #l8 ""
+  !repeat
+    !force search-buffer "me" "^\\([ \t]*\\(```\\|~~~\\)\\|(edit [0-9]+ \\|\\[AI\\( error\\)?: \\)"
+    !iif &not $status  !break
+    beginning-of-line
+    set-variable #l5 @wl
+    !if &len #l1
+      !if &xse #l5 "[ \t]*\\(```\\|~~~\\).*"
+        ai-fence-line #l5 #l1
+        set-variable #l1 %ai-fence
+        !if &not &len #l1
+          !if &seq #l4 "thinking"
+            ; the model's thinking is not sent back
+            set-variable #l6 $window-line
+            set-variable $window-line #l3
+            set-mark
+            set-variable $window-line &add #l6 1
+            -1 kill-region
+            !continue
+          !elif &len #l4
+            ; a tool call, its arguments
+            set-variable #l6 $window-line
+            set-variable #l7 &sub &sub #l6 #l3 1
+            ai-req-move-tc #l3 #l6 #l4 #l7
+            !continue
+          !endif
+        !endif
+      !endif
+    !elif &xse #l5 "[ \t]*\\(```\\|~~~\\).*"
+      set-variable #l3 $window-line
+      ai-fence-line #l5 ""
+      set-variable #l1 %ai-fence
+      set-variable #l4 ""
+      !if &xse #l5 "[ \t]*\\(```+\\|~~~+\\)[ \t]*thinking[ \t]*"
+        set-variable #l4 "thinking"
+      !elif &xse #l5 "[ \t]*\\(```+\\|~~~+\\)[ \t]*tool-call[ \t]+\\([-_.:A-Za-z0-9]+\\)[ \t]+\\([-_.:A-Za-z0-9]+\\)[ \t]*"
+        set-variable #l4 &spr "%s\t%s" @s2 @s3
+      !elif &xse #l5 %ai-edit-fence-x
+        set-variable #l2 &trb @s3
+      !elif &xse #l5 "[ \t]*\\(```+\\|~~~+\\)[ \t]*\\(diff\\|patch\\)\\b.*"
+        set-variable #l2 "diff"
+      !elif &gre $window-line &add %ai-req-line 1
+        backward-line
+        set-variable #l6 @wl
+        forward-line
+        ai-name-above #l6
+        !iif &len #l9  set-variable #l2 #l9
+      !endif
+    !elif &xse #l5 "(edit \\([0-9]+\\) \\(.*\\))"
+      ; reported in the next question rather than as the model's own words
+      set-variable #l6 &spr "- %s edit %s: %s\n" #l2 @s1 @s2
+      set-variable #l7 $buffer-bname
+      find-buffer "*ai-req-st*"
+      end-of-buffer
+      insert-string #l6
+      find-buffer #l7
+      set-mark
+      forward-line
+      -1 kill-region
+      !continue
+    !elif &xse #l5 "\\[AI error: .*"
+      ; the editor's note of an error may run over lines to its closing ]
+      set-mark
+      !force search-buffer "me" "\\]$"
+      !iif &not $status  end-of-buffer
+      forward-line
+      -1 kill-region
+      !continue
+    !elif &xse #l5 "\\[AI: .*\\]"
+      set-mark
+      forward-line
+      -1 kill-region
+      !continue
+    !endif
+    !force forward-line
+    !iif &not $status  !break
+  !done
+  ; an unclosed thinking block runs to the end
+  !if &seq #l4 "thinking"
+    !if &len #l1
+      set-variable $window-line #l3
+      set-mark
+      end-of-buffer
+      -1 kill-region
+    !endif
+  !endif
+  set-variable $window-line %ai-req-line
+  end-of-line
+  forward-delete-char
+  ; without the blank lines left at the start or end
+  !while &and &seq @wc "\n" &les $window-line &sub $window-eline 1
+    forward-delete-char
+  !done
+  end-of-buffer
+  !repeat
+    !iif &and &equ $window-line %ai-req-line &not &gre $window-col %ai-req-col  !break
+    backward-char
+    !iif &not &sin @wc " \t\n"  !break
+    forward-delete-char
+  !done
+  !iif &not &sin @wc " \t\n"  forward-char
+!emacro
+
+; move the tool call block of *ai-req* lines @1 to @2 (its fences) to *ai-req-tc*, @3 is its call
+; id and name, @4 the number of argument lines
+0 define-macro ai-req-move-tc
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l4 @4
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-req-tc*"
+  end-of-buffer
+  insert-string &spr "\t%s\t%d\t\n" #l3 #l4
+  find-buffer #l0
+  !if #l4
+    set-variable $window-line &add #l1 1
+    set-mark
+    set-variable $window-line #l2
+    set-variable #l5 $system
+    set-variable $system &bor #l5 0x800000
+    copy-region
+    find-buffer "*ai-req-tc*"
+    end-of-buffer
+    !force yank
+    -1 yank
+    set-variable $system #l5
+    find-buffer #l0
+  !endif
+  set-variable $window-line #l1
+  set-mark
+  set-variable $window-line &add #l2 1
+  -1 kill-region
+!emacro
+
+; add the tool calls in *ai-req-tc* after the text of the assistant message just written, for
+; the chat API as its tool_calls and for the responses API as function_call items after it
+0 define-macro ai-req-tool-calls
+  set-variable #l0 $buffer-bname
+  !iif &not %ai-req-resp  insert-string ",\"tool_calls\":["
+  set-variable #l9 0
+  set-variable #l8 1
+  !repeat
+    find-buffer "*ai-req-tc*"
+    set-variable $window-line #l8
+    !iif &seq @wc ""  !break
+    set-variable #l1 @wl
+    set-variable #l2 &lget #l1 1
+    set-variable #l3 &lget #l1 2
+    set-variable #l4 &lget #l1 3
+    set-variable #l8 &add &add #l8 1 #l4
+    find-buffer #l0
+    end-of-buffer
+    !if %ai-req-resp
+      !iif %ai-req-n  insert-string ","
+      insert-string &spr "{\"type\":\"function_call\",\"call_id\":\"%s\",\"name\":\"%s\",\"arguments\":\"" #l2 #l3
+    !else
+      !iif #l9  insert-string ","
+      insert-string &spr "{\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"" #l2 #l3
+    !endif
+    set-variable %ai-req-line $window-line
+    set-variable %ai-req-col $window-col
+    !if #l4
+      find-buffer "*ai-req-tc*"
+      set-variable $window-line &sub #l8 #l4
+      set-mark
+      set-variable $window-line #l8
+      set-variable #l5 $system
+      set-variable $system &bor #l5 0x800000
+      copy-region
+      find-buffer #l0
+      !force yank
+      -1 yank
+      set-variable $system #l5
+      ; without the newline that ended the last line
+      backward-delete-char
+    !else
+      insert-string "{}"
+    !endif
+    ai-req-escape
+    !if %ai-req-resp
+      insert-string "\"}"
+      set-variable %ai-req-n &add %ai-req-n 1
+    !else
+      insert-string "\"}}"
+    !endif
+    set-variable #l9 &add #l9 1
+  !done
+  find-buffer #l0
+  !iif &not %ai-req-resp  insert-string "]"
+!emacro
+
+; the text of the edit results moved from the last reply to *ai-req-st*, put before the question
+; just added to *ai-req*. The point is left at the end of the text
+0 define-macro ai-req-results
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-req-st*"
+  end-of-buffer
+  set-variable #l1 &gre $window-line 1
+  !if #l1
+    beginning-of-buffer
+    insert-string "Results of the edits in your last reply, as applied by the editor:\n"
+    end-of-buffer
+    insert-string "\n"
+    set-mark
+    beginning-of-buffer
+    set-variable #l2 $system
+    set-variable $system &bor #l2 0x800000
+    copy-region
+    -1 kill-region
+    find-buffer #l0
+    set-variable $window-line %ai-req-line
+    set-variable $window-col %ai-req-col
+    !force yank
+    -1 yank
+    set-variable $system #l2
+  !endif
+  find-buffer #l0
+  end-of-buffer
+  backward-char
+!emacro
+
+; copy the trimmed lines @3 to @4 (exclusive) of chat buffer @1 as a message for role @2, which is
+; You, AI, System or Tool followed by its call id
 0 define-macro ai-req-section
   set-variable #l1 @3
   set-variable #l2 @4
+  set-variable #l5 @2
+  set-variable #l6 ""
+  !if &xse #l5 "Tool[ \t]+\\(.*\\)"
+    set-variable #l6 @s1
+    set-variable #l5 "Tool"
+  !endif
   set-variable $window-line #l1
   !while &and &les #l1 #l2 &sin @wc "\n"
     forward-line
     set-variable #l1 &add #l1 1
   !done
   !repeat
-    !iif &not &les #l1 #l2  !return
+    !if &not &les #l1 #l2
+      ; a tool's result is needed by its call even when empty
+      !iif &not &seq #l5 "Tool"  !return
+      !break
+    !endif
     set-variable $window-line &sub #l2 1
     !iif &not &sin @wc "\n"  !break
     set-variable #l2 &sub #l2 1
   !done
-  set-variable $window-line #l1
-  set-mark
-  set-variable $window-line &sub #l2 1
-  end-of-line
   set-variable #l3 $system
-  set-variable $system &bor #l3 0x800000
-  copy-region
+  !if &les #l1 #l2
+    set-variable $window-line #l1
+    set-mark
+    set-variable $window-line &sub #l2 1
+    end-of-line
+    set-variable $system &bor #l3 0x800000
+    copy-region
+  !endif
   find-buffer "*ai-req*"
-  ai-req-open &con &seq @2 "You" "user" &con &seq @2 "AI" "assistant" "system" @5
-  !force yank
-  -1 yank
-  set-variable $system #l3
-  !iif &seq @2 "You"  ai-att-expand #l1 #l2
-  !iif &and &seq @2 "System" %ai-req-natt  insert-string &cat "\n\n" %ai-edit-prompt
+  !if &seq #l5 "Tool"
+    ai-req-open "tool" #l6
+  !else
+    ai-req-open &con &seq #l5 "You" "user" &con &seq #l5 "AI" "assistant" "system" ""
+  !endif
+  !if &les #l1 #l2
+    !force yank
+    -1 yank
+    set-variable $system #l3
+  !endif
+  !if &seq #l5 "You"
+    ai-att-expand #l1 #l2
+    ai-req-results
+  !elif &seq #l5 "System"
+    !iif %ai-req-natt  insert-string &cat "\n\n" %ai-edit-prompt
+  !elif &seq #l5 "AI"
+    ai-temp-buffer "*ai-req-tc*"
+    find-buffer "*ai-req*"
+    ai-req-reply
+    find-buffer "*ai-req-tc*"
+    end-of-buffer
+    set-variable #l7 &gre $window-line 1
+    find-buffer "*ai-req*"
+    ; a reply left with no text, such as an error, is not sent, nor an empty one for the responses
+    ; API, its calls are items of their own
+    !if &and &equ $window-line %ai-req-line &equ $window-col %ai-req-col
+      !if &or &not #l7 %ai-req-resp
+        ai-req-drop
+        !iif #l7  ai-req-tool-calls
+        find-buffer @1
+        !return
+      !endif
+    !endif
+    ai-req-escape
+    insert-string "\""
+    !iif &and #l7 &not %ai-req-resp  ai-req-tool-calls
+    insert-string "}"
+    set-variable %ai-req-n &add %ai-req-n 1
+    !iif &and #l7 %ai-req-resp  ai-req-tool-calls
+    find-buffer @1
+    !return
+  !endif
   ai-req-close
-  set-variable #p7 ","
   find-buffer @1
 !emacro
 
+; add the tools the model may call, read_file, search_files and list_files
+0 define-macro ai-req-tools
+  insert-string "\"tools\":["
+  ai-req-tool "read_file" "Read lines of a file of the project. Ask for the lines needed, up to 500 at a time." "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"The file, relative to the project directory\"},\"start_line\":{\"type\":\"integer\",\"description\":\"The first line, from 1\"},\"end_line\":{\"type\":\"integer\",\"description\":\"The last line\"}},\"required\":[\"path\"]}"
+  insert-string ","
+  ai-req-tool "search_files" "Search the files of the project for lines matching an extended regular expression, giving file:line:text for each match, up to 200." "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"The regular expression\"},\"path\":{\"type\":\"string\",\"description\":\"A directory or file to search, the whole project when not given\"}},\"required\":[\"pattern\"]}"
+  insert-string ","
+  ai-req-tool "list_files" "List the files of a directory of the project and those below it." "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"The directory, the project directory when not given\"}}}"
+  insert-string "],"
+!emacro
+
+; a tool definition, name @1, description @2 and JSON parameters @3
+0 define-macro ai-req-tool
+  !if %ai-req-resp
+    insert-string &spr "{\"type\":\"function\",\"name\":\"%s\",\"description\":\"%s\",\"parameters\":%s}" @1 @2 @3
+  !else
+    insert-string &spr "{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":%s}}" @1 @2 @3
+  !endif
+!emacro
+
+; insert value @2 of string field @1 escaped for JSON
+0 define-macro ai-req-field
+  insert-string &spr "\"%s\":\"" @1
+  set-variable %ai-req-line $window-line
+  set-variable %ai-req-col $window-col
+  insert-string @2
+  ai-req-escape
+  insert-string "\""
+!emacro
+
+; build the request for the chat in the current buffer in a temporary file %ai-req-file, streamed
+; when @1 is 1
 0 define-macro ai-build-request
   set-variable #l0 $buffer-bname
   set-variable %ai-req-atts 0
   set-variable %ai-req-bad 0
   set-variable %ai-req-warn ""
+  set-variable %ai-req-n 0
+  set-variable %ai-req-resp &seq %ai-api "responses"
   ; the chat is mapped by the scan, the sections are between its role lines
+  set-variable %ai-att-chat #l0
   ai-att-scan
-  set-variable %ai-req-natt #l9
+  set-variable %ai-req-natt #l8
+  ai-temp-buffer "*ai-req-st*"
   ai-temp-buffer "*ai-req*"
-  insert-string "{\"model\":\""
-  set-variable %ai-req-line $window-line
-  set-variable %ai-req-col $window-col
-  insert-string %ai-model
-  ai-req-escape
-  insert-string &spr "\",\"stream\":%s," &con @1 "true" "false"
+  insert-string "{"
+  ai-req-field "model" %ai-model
+  insert-string &spr ",\"stream\":%s," &con @1 "true" "false"
   ; the reasoning effort is only sent when set, a model without reasoning may refuse it
-  !if &len %ai-effort
-    insert-string "\"reasoning_effort\":\""
-    set-variable %ai-req-line $window-line
-    set-variable %ai-req-col $window-col
-    insert-string %ai-effort
-    ai-req-escape
-    insert-string "\","
+  !if %ai-req-resp
+    ; nothing is kept by the server, the whole chat is sent each time
+    insert-string "\"store\":false,"
+    !if &len %ai-effort
+      insert-string "\"reasoning\":{"
+      ai-req-field "effort" %ai-effort
+      insert-string "},"
+    !endif
+  !else
+    !iif &and @1 %ai-usage  insert-string "\"stream_options\":{\"include_usage\":true},"
+    !if &len %ai-effort
+      ai-req-field "reasoning_effort" %ai-effort
+      insert-string ","
+    !endif
   !endif
-  insert-string "\"messages\":["
-  set-variable #l7 ""
+  set-variable #l1 &trb %ai-extra-json
+  !iif &seq &rig #l1 &sub &len #l1 1 ","  set-variable #l1 &lef #l1 &sub &len #l1 1
+  !iif &len #l1  insert-string &cat #l1 ","
+  !iif %ai-tools  ai-req-tools
+  insert-string &con %ai-req-resp "\"input\":[" "\"messages\":["
   find-buffer #l0
   set-variable #l4 0
   set-variable #l5 0
   !while &not &seq &set #l2 &lget %ai-map-roles &inc #l5 1 ""
     set-variable $window-line #l2
-    !iif &xse @wl "## System[ \t]*"  set-variable #l4 1
+    !iif &and &xse @wl %ai-role-re &seq @s1 "System"  set-variable #l4 1
   !done
   ; with attachments the model is told how to reply with edits, a "## System" part included
   !if &not #l4
-    !if &or &len %ai-system-prompt #l9
+    !if &or &len %ai-system-prompt %ai-req-natt
       find-buffer "*ai-req*"
       ai-req-open "system" ""
       insert-string %ai-system-prompt
-      !iif #l9  insert-string &cat &con &len %ai-system-prompt "\n\n" "" %ai-edit-prompt
+      !iif %ai-req-natt  insert-string &cat &con &len %ai-system-prompt "\n\n" "" %ai-edit-prompt
       ai-req-close
-      set-variable #l7 ","
       find-buffer #l0
     !endif
   !endif
   set-variable #l5 0
   !while &not &seq &set #l2 &lget %ai-map-roles &inc #l5 1 ""
     set-variable $window-line #l2
-    !iif &not &xse @wl "## \\(You\\|AI\\|System\\)[ \t]*"  !abort
+    !iif &not &xse @wl %ai-role-re  !abort
     set-variable #l1 @s1
     set-variable #l3 &lget %ai-map-roles &add #l5 1
     !iif &seq #l3 ""  set-variable #l3 &add $window-eline 1
-    ai-req-section #l0 #l1 &add #l2 1 #l3 #l7
+    ai-req-section #l0 #l1 &add #l2 1 #l3
   !done
   find-buffer "*ai-req*"
   end-of-buffer
@@ -837,6 +1719,8 @@ define-macro ai-chat
   set-variable %ai-req-file &cat $temp-name ".json"
   0 write-buffer %ai-req-file
   0 delete-buffer $buffer-bname
+  !force 0 delete-buffer "*ai-req-st*"
+  !force 0 delete-buffer "*ai-req-tc*"
   !force 0 delete-buffer "*ai-att*"
   !force 0 delete-buffer "*ai-att-text*"
   find-buffer #l0
@@ -960,10 +1844,12 @@ define-macro ai-chat
   find-buffer #l0
 !emacro
 
-; put the error from the reply in the current buffer, or its first line, into the chat
+; put the error from the reply in the current buffer, or its first line, into the chat. @1 is the
+; text to give when there is neither and @2 the HTTP status when it is known, else 0
 0 define-macro ai-reply-error
   set-variable #l0 $buffer-bname
   set-variable #l1 @1
+  set-variable #l2 @2
   beginning-of-buffer
   !force search-buffer "me" "\"message\"[ \t\r\n]*:[ \t\r\n]*\""
   !if $status
@@ -977,9 +1863,309 @@ define-macro ai-chat
       beginning-of-line
       set-variable #l1 &trb @wl
     !endif
+    !iif &gre #l2 0  set-variable #l1 &spr "HTTP %d, %s" #l2 #l1
     ai-target-insert &spr "[AI error: %s]" #l1
   !endif
   find-buffer #l0
+!emacro
+
+; the reply's text from the JSON string at the point, after the model's thinking when that was
+; shown
+0 define-macro ai-reply-text
+  !if &equ %ai-think 1
+    ai-target-insert "\n```\n\n"
+    set-variable %ai-think 3
+  !endif
+  ai-json-string %ai-target
+  set-variable %ai-got 1
+!emacro
+
+; the model's thinking from the JSON string at the point, shown in a thinking block before the
+; reply when %ai-reasoning is 1, which is not sent back
+0 define-macro ai-reply-reasoning
+  !if &not %ai-reasoning
+    set-variable %ai-think 2
+  !elif &not %ai-got
+    !if &not &equ %ai-think 1
+      ai-target-insert "```thinking\n"
+      set-variable %ai-think 1
+    !endif
+    ai-json-string %ai-target
+  !endif
+!emacro
+
+; set %ai-usage-in, -out, -cached & -reasoning from the usage object after the point, the numbers
+; are searched for with @1 search-buffer, -1 keeping to the line
+0 define-macro ai-usage-parse
+  set-variable #l9 @1
+  set-variable #l1 $window-line
+  set-variable #l2 $window-col
+  !force #l9 search-buffer "me" "\"\\(prompt\\|input\\)_tokens\"[ \t\r\n]*:[ \t\r\n]*\\([0-9]+\\)"
+  !iif $status  set-variable %ai-usage-in @s2
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  !force #l9 search-buffer "me" "\"\\(completion\\|output\\)_tokens\"[ \t\r\n]*:[ \t\r\n]*\\([0-9]+\\)"
+  !iif $status  set-variable %ai-usage-out @s2
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  !force #l9 search-buffer "me" "\"cached_tokens\"[ \t\r\n]*:[ \t\r\n]*\\([0-9]+\\)"
+  !iif $status  set-variable %ai-usage-cached @s1
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  !force #l9 search-buffer "me" "\"reasoning_tokens\"[ \t\r\n]*:[ \t\r\n]*\\([0-9]+\\)"
+  !iif $status  set-variable %ai-usage-reasoning @s1
+  set-variable %ai-usage-got 1
+!emacro
+
+; start a new tool call with id @1 and name @2, its arguments go to *ai-tc-N*
+0 define-macro ai-tc-add
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-tc*"
+  end-of-buffer
+  insert-string &spr "\t%s\t%s\t\n" #l1 #l2
+  ai-temp-buffer &spr "*ai-tc-%d*" %ai-tc-n
+  set-variable %ai-tc-n &add %ai-tc-n 1
+  find-buffer #l0
+!emacro
+
+; set field @2 (1 the id, 2 the name) of tool call @1 (from 0), adding calls up to it
+0 define-macro ai-tc-set
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  !while &not &gre %ai-tc-n #l1
+    ai-tc-add "" ""
+  !done
+  !iif &not &len #l3  !return
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-tc*"
+  set-variable $window-line &add #l1 1
+  set-variable @wl &lset @wl #l2 #l3
+  find-buffer #l0
+!emacro
+
+; a function call of the responses API from the point, its fields searched for with @1
+; search-buffer, -1 keeping to the line
+0 define-macro ai-resp-call
+  set-variable #l9 @1
+  set-variable #l1 $window-line
+  set-variable #l2 $window-col
+  !force #l9 search-buffer "me" "\"call_id\"[ \t\r\n]*:[ \t\r\n]*\"\\([^\"\n]*\\)\""
+  !iif &not $status  !return
+  set-variable #l3 @s1
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  !force #l9 search-buffer "me" "\"name\"[ \t\r\n]*:[ \t\r\n]*\"\\([^\"\n]*\\)\""
+  !iif &not $status  !return
+  set-variable #l4 @s1
+  set-variable #l5 %ai-tc-n
+  ai-tc-add #l3 #l4
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  !force #l9 search-buffer "me" "\"arguments\"[ \t\r\n]*:[ \t\r\n]*\""
+  !iif $status  ai-json-string &spr "*ai-tc-%d*" #l5
+!emacro
+
+; the tool_calls of a chat API delta on the current line, after the point. Each entry has an
+; index and the first gives its id and name, its arguments come in parts
+0 define-macro ai-stream-tool-calls
+  !repeat
+    !force -1 search-buffer "me" "\"index\"[ \t]*:[ \t]*\\([0-9]+\\)"
+    !iif &not $status  !break
+    set-variable #l1 @s1
+    set-variable #l2 $window-col
+    ; where the next entry starts
+    set-variable #l3 1000000
+    !force -1 search-buffer "me" "\"index\"[ \t]*:"
+    !iif $status  set-variable #l3 $window-col
+    set-variable $window-col #l2
+    ai-tc-set #l1 0 ""
+    !force -1 search-buffer "me" "\"id\"[ \t]*:[ \t]*\"\\([^\"\n]*\\)\""
+    !if $status
+      set-variable #l4 @s1
+      !iif &les $window-col #l3  ai-tc-set #l1 1 #l4
+    !endif
+    set-variable $window-col #l2
+    !force -1 search-buffer "me" "\"name\"[ \t]*:[ \t]*\"\\([^\"\n]*\\)\""
+    !if $status
+      set-variable #l4 @s1
+      !iif &les $window-col #l3  ai-tc-set #l1 2 #l4
+    !endif
+    set-variable $window-col #l2
+    !force -1 search-buffer "me" "\"arguments\"[ \t]*:[ \t]*\""
+    !if $status
+      !iif &les $window-col #l3  ai-json-string &spr "*ai-tc-%d*" #l1
+    !endif
+    set-variable $window-col #l2
+    !iif &equ #l3 1000000  !break
+  !done
+!emacro
+
+; the tool calls of a chat API reply, from the point after its "tool_calls"
+0 define-macro ai-http-tool-calls
+  !repeat
+    !force search-buffer "me" "\"id\"[ \t\r\n]*:[ \t\r\n]*\"\\([^\"\n]*\\)\""
+    !iif &not $status  !break
+    set-variable #l1 @s1
+    !force search-buffer "me" "\"name\"[ \t\r\n]*:[ \t\r\n]*\"\\([^\"\n]*\\)\""
+    !iif &not $status  !break
+    set-variable #l2 @s1
+    set-variable #l5 %ai-tc-n
+    ai-tc-add #l1 #l2
+    !force search-buffer "me" "\"arguments\"[ \t\r\n]*:[ \t\r\n]*\""
+    !iif $status  ai-json-string &spr "*ai-tc-%d*" #l5
+  !done
+!emacro
+
+; add the tool calls received to the reply as tool-call blocks, which ask for them
+0 define-macro ai-tc-write
+  set-variable #l0 $buffer-bname
+  set-variable #l1 0
+  !while &les #l1 %ai-tc-n
+    find-buffer "*ai-tc*"
+    set-variable $window-line &add #l1 1
+    set-variable #l2 &lget @wl 1
+    set-variable #l3 &lget @wl 2
+    ; an id the chat can hold, some servers give none
+    set-variable #l2 &xrep #l2 "[^-_.:A-Za-z0-9]" "_"
+    !iif &not &len #l2  set-variable #l2 &spr "call_%d" #l1
+    set-variable #l3 &xrep #l3 "[^-_.:A-Za-z0-9]" "_"
+    !if &len #l3
+      ; after a blank line
+      find-buffer %ai-target
+      ai-target-mark
+      !if &gre $window-col 0
+        ai-target-insert "\n\n"
+      !elif &gre $window-line 1
+        backward-line
+        set-variable #l4 &xse @wl "[ \t]*"
+        forward-line
+        !iif &not #l4  ai-target-insert "\n"
+      !endif
+      ai-target-insert &spr "```tool-call %s %s\n" #l2 #l3
+      find-buffer &spr "*ai-tc-%d*" #l1
+      end-of-buffer
+      set-variable #l4 &or &gre $window-line 1 $window-col
+      !if #l4
+        set-mark
+        beginning-of-buffer
+        set-variable #l5 $system
+        set-variable $system &bor #l5 0x800000
+        copy-region
+        find-buffer %ai-target
+        ai-target-mark
+        !force yank
+        -1 yank
+        set-alpha-mark "\xa4"
+        set-variable $system #l5
+      !else
+        ai-target-insert "{}"
+      !endif
+      find-buffer %ai-target
+      ai-target-mark
+      ai-target-insert &con &gre $window-col 0 "\n```\n" "```\n"
+    !endif
+    !force 0 delete-buffer &spr "*ai-tc-%d*" #l1
+    set-variable #l1 &add #l1 1
+  !done
+  !force 0 delete-buffer "*ai-tc*"
+  find-buffer #l0
+!emacro
+
+; the lines of the reply that look like the status lines the editor writes after edit blocks
+; were written by the model, which would stop their changes being applied, so are removed
+0 define-macro ai-reply-unstatus
+  goto-alpha-mark "\xa4"
+  set-variable #l2 $window-line
+  goto-alpha-mark "\xa5"
+  set-variable #l1 ""
+  !repeat
+    !force search-buffer "me" "^\\([ \t]*\\(```\\|~~~\\)\\|(edit [0-9]+ \\)"
+    !iif &or &not $status &gre $window-line #l2  !break
+    beginning-of-line
+    !if &xse @wl "[ \t]*\\(```\\|~~~\\).*"
+      ai-fence-line @wl #l1
+      set-variable #l1 %ai-fence
+    !elif &and &not &len #l1 &xse @wl "(edit [0-9]+ \\(applied\\|rejected\\|failed\\|skipped\\|undone\\)[,)].*"
+      beginning-of-line
+      set-mark
+      forward-line
+      -1 kill-region
+      set-variable #l2 &sub #l2 1
+      !continue
+    !endif
+    !force forward-line
+    !iif &not $status  !break
+  !done
+!emacro
+
+; the integer seconds of $unix-time
+0 define-macro ai-now
+  set-variable #l1 $unix-time
+  set-variable #p9 &lef #l1 &sub &sin "." #l1 1
+!emacro
+
+; show how the request is going in the chat's mode line, once a second while it is busy
+0 define-macro ai-tick
+  !iif &not %ai-busy  !return
+  !iif &not &exi &spr ":%s:" %ai-target  !return
+  ai-now
+  set-variable #l1 &sub #l9 %ai-t0
+  !if %ai-retry-at
+    set-variable #l2 &spr "trying again in %ds" &sub %ai-retry-at #l9
+  !elif %ai-got
+    set-variable #l2 &spr "writing %ds" #l1
+  !elif %ai-tc-n
+    set-variable #l2 &spr "asking for tools %ds" #l1
+  !elif %ai-think
+    set-variable #l2 &spr "thinking %ds" #l1
+  !else
+    set-variable #l2 &spr "waiting %ds" #l1
+  !endif
+  set-variable #l0 $buffer-bname
+  find-buffer %ai-target
+  ; after the buffer's name, so it is not cut off, and without a - which the mode line would fill
+  set-variable #l3 &spr "[AI %s] " #l2
+  !if &sin "%b" %ai-ml-saved
+    set-variable $buffer-mode-line &rep %ai-ml-saved "%b" &cat "%b " #l3
+  !else
+    set-variable $buffer-mode-line &cat #l3 %ai-ml-saved
+  !endif
+  find-buffer #l0
+  1000 create-callback ai-tick
+!emacro
+
+; put the chat's mode line back
+0 define-macro ai-tick-stop
+  !force -1 create-callback ai-tick
+  !iif &not &exi &spr ":%s:" %ai-target  !return
+  set-variable #l0 $buffer-bname
+  find-buffer %ai-target
+  !iif &len %ai-ml-saved  set-variable $buffer-mode-line %ai-ml-saved
+  find-buffer #l0
+!emacro
+
+; the role line of the reply, with the model and the tokens used
+0 define-macro ai-reply-role
+  set-variable #l1 %ai-reply-info
+  !if %ai-usage-got
+    set-variable #l1 &spr "%s, %d tokens in" #l1 %ai-usage-in
+    !iif %ai-usage-cached  set-variable #l1 &spr "%s (%d cached)" #l1 %ai-usage-cached
+    set-variable #l1 &spr "%s, %d out" #l1 %ai-usage-out
+    !iif %ai-usage-reasoning  set-variable #l1 &spr "%s (%d reasoning)" #l1 %ai-usage-reasoning
+  !endif
+  goto-alpha-mark "\xa5"
+  set-variable #l2 0
+  !while &and &gre $window-line 1 &les #l2 3
+    backward-line
+    !if &xse @wl %ai-ai-re
+      set-variable @wl &spr "## AI <!-- %s -->" #l1
+      !return
+    !endif
+    set-variable #l2 &add #l2 1
+  !done
 !emacro
 
 ; there is no soft wrap, so split the long prose lines of the reply, between alpha marks
@@ -1035,33 +2221,202 @@ define-macro ai-chat
   !iif &len %ai-hdr-file  !force 0x20 file-op %ai-hdr-file
   set-variable %ai-req-file ""
   set-variable %ai-hdr-file ""
+  set-variable %ai-req-key ""
+  set-variable %ai-retry-at 0
+  ai-tick-stop
   find-buffer %ai-target
+  ; the thinking shown is closed when no text came after it
+  !if &equ %ai-think 1
+    ai-target-insert "\n```\n"
+    set-variable %ai-think 3
+  !endif
+  set-variable #l1 &and %ai-tc-n &not %ai-cancel
+  !if %ai-tc-n
+    !iif #l1  ai-tc-write
+    !force 0 delete-buffer "*ai-tc*"
+  !endif
+  !iif %ai-got  ai-reply-unstatus
   !iif %ai-wrap  !force ai-wrap-reply
+  ai-reply-role
   ; the edits of a reply to ai-edit are reviewed once the reply is in
   !if %ai-edit-review-next
     set-variable %ai-edit-review-next 0
     !if &and &and %ai-got &not %ai-cancel %ai-edit-review
       goto-alpha-mark "\xa5"
-      !force search-buffer "me" %ai-edit-fence
-      !if $status
+      ai-edit-any
+      !if $result
         set-variable %ai-edit-review-chat %ai-target
         set-variable %ai-edit-review-keys &cat $recent-keys "x"
         1 create-callback ai-edit-review
       !endif
     !endif
   !endif
+  ; a reply to ai-commit-message goes into the buffer it was asked from
+  !if %ai-insert-next
+    set-variable %ai-insert-next 0
+    !if &and %ai-got &not %ai-cancel
+      set-variable %ai-insert-chat %ai-target
+      set-variable %ai-edit-review-keys &cat $recent-keys "x"
+      1 create-callback ai-insert-review
+    !endif
+  !endif
   ; a reply cut short in a code block would hide the next role line
   ai-chat-map
   ai-chat-close-fence
   ai-chat-separate
-  insert-string "## You\n\n"
+  !if %ai-cancel
+    insert-string "[AI: cancelled]\n\n"
+  !elif &seq %ai-finish-reason "length"
+    insert-string "[AI: the reply was cut short, it reached the model's output limit]\n\n"
+  !elif &seq %ai-finish-reason "content_filter"
+    insert-string "[AI: the reply was stopped by the content filter]\n\n"
+  !endif
+  ; the tools the model asks for are run once the user has said it may
+  !if #l1
+    set-variable %ai-tool-chat %ai-target
+    set-variable %ai-edit-review-keys &cat $recent-keys "x"
+    1 create-callback ai-tool-review
+  !else
+    insert-string "## You\n\n"
+  !endif
+  ; the chat's running total
+  !if %ai-usage-got
+    set-variable :ai-tokens-in &add &con &exi :ai-tokens-in :ai-tokens-in 0 %ai-usage-in
+    set-variable :ai-tokens-out &add &con &exi :ai-tokens-out :ai-tokens-out 0 %ai-usage-out
+    set-variable #l2 &spr ", %d in + %d out tokens, the chat %d + %d" %ai-usage-in %ai-usage-out :ai-tokens-in :ai-tokens-out
+  !else
+    set-variable #l2 ""
+  !endif
+  !force ai-chat-save
   find-buffer #l0
   set-variable %ai-busy 0
-  !if %ai-got
-    ml-write &spr "[AI: %s replied]" %ai-model
+  !if %ai-cancel
+    ml-write "[AI: cancelled]"
+  !elif #l1
+    ml-write &spr "[AI: %s asks to use tools%s]" %ai-model #l2
+  !elif %ai-got
+    ml-write &spr "[AI: %s replied%s]" %ai-model #l2
   !else
     ml-write "[AI: request failed, see the chat]"
   !endif
+!emacro
+
+; $result is 1 when the reply from the point has changes the editor can apply
+0 define-macro ai-edit-any
+  set-variable #l1 $window-line
+  set-variable $result 0
+  !force search-buffer "me" %ai-edit-fence
+  !if &not $status
+    set-variable $window-line #l1
+    !force search-buffer "me" "^<<<<<<<+[ \t]*SEARCH[ \t]*$"
+  !endif
+  !if &not $status
+    set-variable $window-line #l1
+    !force search-buffer "me" "^@@ -[0-9]"
+  !endif
+  set-variable #l2 $status
+  set-variable $window-line #l1
+  set-variable $result #l2
+!emacro
+
+; wait %ai-retry-wait seconds, doubling each time, then send the request again
+0 define-macro ai-retry-later
+  set-variable #l1 @1
+  set-variable %ai-attempt &add %ai-attempt 1
+  set-variable #l2 %ai-retry-wait
+  set-variable #l3 1
+  !while &les #l3 %ai-attempt
+    set-variable #l2 &mul #l2 2
+    set-variable #l3 &add #l3 1
+  !done
+  ai-now
+  set-variable %ai-retry-at &add #l9 #l2
+  set-variable #l4 &mul #l2 1000
+  #l4 create-callback ai-retry-send
+  ml-write &spr "[AI: %s, trying again in %ds (%d of %d), C-c C-k cancels]" #l1 #l2 %ai-attempt %ai-retries
+!emacro
+
+0 define-macro ai-retry-send
+  !iif &not %ai-retry-at  !return
+  set-variable %ai-retry-at 0
+  !iif &or &not %ai-busy %ai-cancel  !return
+  !if &seq %ai-req-how "curl"
+    !force ai-curl-run
+  !else
+    !force ai-http-start
+  !endif
+  !if &not $status
+    ai-target-insert "[AI error: the request macro failed]"
+    ai-finish
+  !endif
+!emacro
+
+; $result is 1 when the reply in the current buffer, from the built in client, failed for a
+; reason that may pass: no reply, a rate limit or a server error
+0 define-macro ai-http-retryable
+  beginning-of-buffer
+  set-variable $result 1
+  !force search-buffer "me" "[^ \t\r\n]"
+  !iif &not $status  !return
+  beginning-of-buffer
+  !force search-buffer "me" "rate.limit\\|server_error\\|overloaded\\|temporarily unavailable\\|\"code\"[ \t\r\n]*:[ \t\r\n]*5[0-9][0-9]"
+  set-variable $result $status
+!emacro
+
+; the reply of the built in client in the current buffer
+0 define-macro ai-http-parse
+  !if %ai-req-resp
+    ; the responses API's thinking summaries, text and function calls, in order
+    beginning-of-buffer
+    !repeat
+      !force search-buffer "me" "\"type\"[ \t\r\n]*:[ \t\r\n]*\"\\(output_text\\|summary_text\\|function_call\\)\""
+      !iif &not $status  !break
+      set-variable #l1 @s1
+      set-variable #l2 $window-line
+      set-variable #l3 $window-col
+      !if &seq #l1 "function_call"
+        ai-resp-call 1
+      !else
+        !force search-buffer "me" "\"text\"[ \t\r\n]*:[ \t\r\n]*\""
+        !if $status
+          !if &seq #l1 "output_text"
+            ai-reply-text
+          !else
+            ai-reply-reasoning
+          !endif
+        !endif
+      !endif
+      set-variable $window-line #l2
+      set-variable $window-col #l3
+    !done
+    beginning-of-buffer
+    !force search-buffer "me" "\"incomplete_details\"[ \t\r\n]*:[ \t\r\n]*{[^}]*\"reason\"[ \t\r\n]*:[ \t\r\n]*\"\\([a-z_]+\\)\""
+    !iif $status  set-variable %ai-finish-reason &con &seq @s1 "content_filter" "content_filter" "length"
+  !else
+    beginning-of-buffer
+    !force search-buffer "me" "\"choices\"[ \t\r\n]*:"
+    !if $status
+      set-variable #l2 $window-line
+      set-variable #l3 $window-col
+      !force search-buffer "me" "\"reasoning\\(_content\\)?\"[ \t\r\n]*:[ \t\r\n]*\""
+      !iif $status  ai-reply-reasoning
+      set-variable $window-line #l2
+      set-variable $window-col #l3
+      !force search-buffer "me" "\"content\"[ \t\r\n]*:[ \t\r\n]*\""
+      !iif $status  ai-reply-text
+      set-variable $window-line #l2
+      set-variable $window-col #l3
+      !force search-buffer "me" "\"finish_reason\"[ \t\r\n]*:[ \t\r\n]*\"\\([a-z_]+\\)\""
+      !iif $status  set-variable %ai-finish-reason @s1
+      set-variable $window-line #l2
+      set-variable $window-col #l3
+      !force search-buffer "me" "\"tool_calls\"[ \t\r\n]*:[ \t\r\n]*\\["
+      !iif $status  ai-http-tool-calls
+    !endif
+  !endif
+  beginning-of-buffer
+  !force search-buffer "me" "\"usage\"[ \t\r\n]*:[ \t\r\n]*{"
+  !iif $status  ai-usage-parse 1
 !emacro
 
 ; the built-in HTTP client, waits for the whole reply
@@ -1072,13 +2427,13 @@ define-macro ai-chat
   set-variable #l3 &exi %http-flags
   !iif #l3  set-variable #l4 %http-flags
   set-variable %http-header ":POST:Content-Type: application/json"
-  !iif &len @1  set-variable %http-header &spr "%s\r\nAuthorization: Bearer %s" %http-header @1
+  !iif &len %ai-req-key  set-variable %http-header &spr "%s\r\nAuthorization: Bearer %s" %http-header %ai-req-key
   ; flag d would log the key to *http-console*
   !iif #l3  set-variable %http-flags &rep #l4 "d" ""
   set-variable %http-post-file %ai-req-file
   ai-temp-buffer "*ai-response*"
   ml-write &spr "[AI: waiting for %s%s...]" %ai-model %ai-req-note
-  !force insert-file &cat %ai-base-url "/chat/completions"
+  !force insert-file &cat %ai-base-url %ai-req-path
   !force unset-variable %http-post-file
   !if #l1
     set-variable %http-header #l2
@@ -1086,32 +2441,33 @@ define-macro ai-chat
     unset-variable %http-header
   !endif
   !iif #l3  set-variable %http-flags #l4
-  beginning-of-buffer
-  !force search-buffer "me" "\"choices\"[ \t\r\n]*:"
-  !if $status
-    !force search-buffer "me" "\"content\"[ \t\r\n]*:[ \t\r\n]*\""
-    !if $status
-      ai-json-string %ai-target
-      set-variable %ai-got 1
+  ai-http-parse
+  !if &not &or %ai-got %ai-tc-n
+    ai-http-retryable
+    !if &and $result &les %ai-attempt %ai-retries
+      ai-retry-later "the server did not reply"
+      find-buffer #l0
+      !return
     !endif
+    ai-reply-error "no reply from the server" 0
   !endif
-  !iif &not %ai-got  ai-reply-error "no reply from the server"
   ai-finish
   find-buffer #l0
 !emacro
 
 ; curl, the reply streams in as server-sent events through ai-stream-ipipe
-0 define-macro ai-curl-start
+0 define-macro ai-curl-run
   set-variable #l0 $buffer-bname
   set-variable %ai-hdr-file &cat $temp-name ".hdr"
   ai-temp-buffer "*ai-hdr*"
   insert-string "Content-Type: application/json\n"
-  !iif &len @1  insert-string &spr "Authorization: Bearer %s\n" @1
+  !iif &len %ai-req-key  insert-string &spr "Authorization: Bearer %s\n" %ai-req-key
   !iif &not &seq $platform "windows"  set-variable $buffer-fmod 384
   0 write-buffer %ai-hdr-file
   ; write-buffer renames the buffer after the file
   0 delete-buffer $buffer-bname
-  set-variable #l1 &spr "%s -sS -N -H \"@%s\" --data-binary \"@%s\" \"%s/chat/completions\" 2>&1" %ai-curl %ai-hdr-file %ai-req-file %ai-base-url
+  ; the HTTP status is written after the reply so a busy server can be tried again
+  set-variable #l1 &spr "%s -sS -N --connect-timeout 30 --speed-limit 1 --speed-time %d %s --write-out \"\\nai-http-status:%%{http_code}\\n\" -H \"@%s\" --data-binary \"@%s\" \"%s%s\" 2>&1" %ai-curl %ai-timeout %ai-curl-args %ai-hdr-file %ai-req-file %ai-base-url %ai-req-path
   set-variable %ai-sline 1
   !force 0 delete-buffer "*ai-stream*"
   !force 0x20c2 ipipe-shell-command #l1 "*ai-stream*" ai-stream-ipipe
@@ -1129,12 +2485,78 @@ define-macro ai-chat
   set-variable #l0 &lef @wl 12
   !iif &not &seq &lef #l0 6 "data: "  !return
   !iif &seq #l0 "data: [DONE]"  !return
+  !if %ai-req-resp
+    ai-stream-event-r
+    !return
+  !endif
+  ; the usage comes in an event of its own at the end, when asked for
+  !force -1 search-buffer "me" "\"usage\"[ \t]*:[ \t]*{"
+  !iif $status  ai-usage-parse -1
+  beginning-of-line
+  !force -1 search-buffer "me" "\"finish_reason\"[ \t]*:[ \t]*\"\\([a-z_]+\\)\""
+  !iif $status  set-variable %ai-finish-reason @s1
+  beginning-of-line
   !force -1 search-buffer "me" "\"delta\"[ \t]*:[ \t]*{"
   !iif &not $status  !return
+  set-variable #l1 $window-col
+  !force -1 search-buffer "me" "\"reasoning\\(_content\\)?\"[ \t]*:[ \t]*\""
+  !iif $status  ai-reply-reasoning
+  set-variable $window-col #l1
   !force -1 search-buffer "me" "\"content\"[ \t]*:[ \t]*\""
+  !iif $status  ai-reply-text
+  set-variable $window-col #l1
+  !force -1 search-buffer "me" "\"tool_calls\"[ \t]*:[ \t]*\\["
+  !iif $status  ai-stream-tool-calls
+!emacro
+
+; an event of the responses API
+0 define-macro ai-stream-event-r
+  !force -1 search-buffer "me" "\"type\"[ \t]*:[ \t]*\"\\([a-z_.]+\\)\""
   !iif &not $status  !return
-  ai-json-string %ai-target
-  set-variable %ai-got 1
+  set-variable #l1 @s1
+  !if &seq #l1 "response.output_text.delta"
+    !force -1 search-buffer "me" "\"delta\"[ \t]*:[ \t]*\""
+    !iif $status  ai-reply-text
+  !elif &or &seq #l1 "response.reasoning_summary_text.delta" &seq #l1 "response.reasoning_text.delta"
+    !force -1 search-buffer "me" "\"delta\"[ \t]*:[ \t]*\""
+    !iif $status  ai-reply-reasoning
+  !elif &seq #l1 "response.reasoning_summary_part.added"
+    ; summary parts are paragraphs
+    !iif &equ %ai-think 1  ai-target-insert "\n\n"
+  !elif &seq #l1 "response.output_item.done"
+    !force -1 search-buffer "me" "\"item\"[ \t]*:[ \t]*{"
+    !iif &not $status  !return
+    set-variable #l2 $window-col
+    !force -1 search-buffer "me" "\"type\"[ \t]*:[ \t]*\"function_call\""
+    !iif &not $status  !return
+    set-variable $window-col #l2
+    ai-resp-call -1
+  !elif &lfind "|response.completed|response.incomplete|response.failed|" #l1
+    set-variable #l2 $window-col
+    !force -1 search-buffer "me" "\"usage\"[ \t]*:[ \t]*{"
+    !iif $status  ai-usage-parse -1
+    set-variable $window-col #l2
+    !force -1 search-buffer "me" "\"incomplete_details\"[ \t]*:[ \t]*{[^}\n]*\"reason\"[ \t]*:[ \t]*\"\\([a-z_]+\\)\""
+    !iif $status  set-variable %ai-finish-reason &con &seq @s1 "content_filter" "content_filter" "length"
+    set-variable $window-col #l2
+    !if &seq #l1 "response.failed"
+      !force -1 search-buffer "me" "\"message\"[ \t]*:[ \t]*\""
+      !if $status
+        ai-target-insert "[AI error: "
+        ai-json-string %ai-target
+        ai-target-insert "]"
+        set-variable %ai-failed 1
+      !endif
+    !endif
+  !elif &seq #l1 "error"
+    !force -1 search-buffer "me" "\"message\"[ \t]*:[ \t]*\""
+    !if $status
+      ai-target-insert "[AI error: "
+      ai-json-string %ai-target
+      ai-target-insert "]"
+      set-variable %ai-failed 1
+    !endif
+  !endif
 !emacro
 
 ; process each complete event, a blank line ends an event and lines over 2046
@@ -1152,6 +2574,14 @@ define-macro ai-chat
     !until &sin @wc "\n"
     !iif &and @1 &seq @wc ""  !break
     set-variable #l2 $window-line
+    ; an event's name or a comment is a line of its own before its data
+    set-variable $window-line #l1
+    !while &and &les &add #l1 1 #l2 &or &seq &lef @wl 6 "event:" &seq @wc ":"
+      set-mark
+      forward-line
+      -1 kill-region
+      set-variable #l2 &sub #l2 1
+    !done
     set-variable $window-line #l1
     !while &les &add #l1 1 #l2
       end-of-line
@@ -1173,17 +2603,36 @@ define-macro ai-chat
     !force 0x20 file-op %ai-hdr-file
     set-variable %ai-hdr-file ""
   !endif
+  !if &not #l8
+    ; the HTTP status curl writes at the end, which is not an event
+    set-variable #l7 0
+    end-of-buffer
+    ; it may follow a reply with no newline at its end
+    !force search-buffer "bme" "ai-http-status:\\([0-9]+\\)"
+    !if $status
+      set-variable #l7 @s1
+      set-mark
+      end-of-line
+      -1 kill-region
+    !endif
+  !endif
   !force ai-stream-parse #l8
   !if &not #l8
     !if %ai-cancel
-      ai-target-insert &con %ai-got "\n[AI: cancelled]" "[AI: cancelled]"
-    !elif &not %ai-got
-      ai-reply-error &spr "curl exit code %s" #l9
+    !elif &or %ai-got %ai-tc-n
+    !elif %ai-failed
+    !elif &and &or &equ #l7 0 &or &equ #l7 429 &not &les #l7 500 &les %ai-attempt %ai-retries
+      ; no connection, a rate limit or a server error may pass
+      ai-retry-later &con #l7 &spr "HTTP %d" #l7 "no connection"
+      !return
+    !else
+      ai-reply-error &spr "curl exit code %s" #l9 #l7
     !endif
     ai-finish
   !endif
 !emacro
 
+; send the chat in the current buffer, the last part of which is the question or tool results
 0 define-macro ai-start
   !if &seq %ai-model ""
     ai-set-model
@@ -1200,34 +2649,61 @@ define-macro ai-chat
   set-variable %ai-target $buffer-bname
   ai-build-request &seq #l2 "curl"
   set-variable %ai-req-note &con &len %ai-effort &spr ", %s effort" %ai-effort ""
+  ; the size of a request with attachments, or a large one, is shown and a very large one asked about
+  set-variable #l4 &stat "s" %ai-req-file
+  set-variable #l5 &div #l4 4
+  set-variable #l5 &con &les #l5 1000 #l5 &spr "%dK" &div &add #l5 500 1000
   !if %ai-req-atts
-    set-variable #l4 &stat "s" %ai-req-file
-    set-variable #l5 &div #l4 4
-    set-variable #l5 &con &les #l5 1000 #l5 &spr "%dK" &div &add #l5 500 1000
     set-variable %ai-req-note &spr "%s, %d attachment%s, about %s tokens" %ai-req-note %ai-req-atts &con &equ %ai-req-atts 1 "" "s" #l5
-    !if &gre #l4 %ai-attach-max
-      !if &not &iseq @mc1 &spr "The request is about %s tokens, send it (y/n)? " #l5 "yYnN" "y"
-        !force 0x20 file-op %ai-req-file
-        set-variable %ai-req-file ""
-        !abort
-      !endif
+  !elif &gre #l4 20000
+    set-variable %ai-req-note &spr "%s, about %s tokens" %ai-req-note #l5
+  !endif
+  !if &gre #l4 %ai-request-max
+    !if &not &iseq @mc1 &spr "The request is about %s tokens, send it (y/n)? " #l5 "yYnN" "y"
+      !force 0x20 file-op %ai-req-file
+      set-variable %ai-req-file ""
+      !abort
     !endif
   !endif
   !iif &len %ai-req-warn  set-variable %ai-req-note &spr "%s, %s" %ai-req-note %ai-req-warn
   ; a code block the question leaves open would hide the reply's role line, the request mapped it
   ai-chat-close-fence
   ai-chat-separate
-  insert-string "## AI\n\n"
+  set-variable %ai-reply-info &cat %ai-model &con &len %ai-effort &spr ", %s effort" %ai-effort ""
+  insert-string &spr "## AI <!-- %s -->\n\n" %ai-reply-info
   set-alpha-mark "\xa4"
   set-alpha-mark "\xa5"
   set-variable %ai-busy 1
   set-variable %ai-got 0
   set-variable %ai-cancel 0
+  set-variable %ai-failed 0
+  set-variable %ai-finish-reason ""
+  set-variable %ai-usage-got 0
+  set-variable %ai-usage-in 0
+  set-variable %ai-usage-out 0
+  set-variable %ai-usage-cached 0
+  set-variable %ai-usage-reasoning 0
+  set-variable %ai-think 0
+  set-variable %ai-tc-n 0
+  set-variable %ai-attempt 0
+  set-variable %ai-retry-at 0
+  set-variable %ai-req-key #l1
+  set-variable %ai-req-how #l2
+  set-variable %ai-req-path &con %ai-req-resp "/responses" "/chat/completions"
+  !force 0 delete-buffer "*ai-tc*"
+  ai-temp-buffer "*ai-tc*"
+  find-buffer %ai-target
+  !force ai-chat-save
+  ; the mode line says how the request is going
+  set-variable %ai-ml-saved $buffer-mode-line
+  ai-now
+  set-variable %ai-t0 #l9
+  !iif &seq #l2 "curl"  1000 create-callback ai-tick
   !if &seq #l2 "curl"
-    !force ai-curl-start #l1
+    !force ai-curl-run
     set-variable #l3 $status
   !else
-    !force ai-http-start #l1
+    !force ai-http-start
     set-variable #l3 $status
   !endif
   ; never leave a failed request busy with its files behind
@@ -1246,7 +2722,7 @@ define-macro ai-send
   set-variable #l1 %ai-map-last
   !if #l1
     set-variable $window-line #l1
-    set-variable #l1 &xse @wl "## You[ \t]*"
+    set-variable #l1 &xse @wl %ai-you-re
   !endif
   !if &and &not #l1 %ai-map-open
     ; the role lines after a code block left open are its text
@@ -1265,6 +2741,8 @@ define-macro ai-send
     ml-write "[AI Error: write a question under \"## You\" first]"
     !abort
   !endif
+  set-variable %ai-tool-round 0
+  !iif &exi :ai-chat  set-variable %ai-chat-buf $buffer-bname
   ai-start
 !emacro
 
@@ -1476,7 +2954,27 @@ define-macro ai-show-attachment
   set-variable #l4 @s1
   set-variable #l5 @s2
   ai-att-parse #l4 #l5
-  !if &seq #l4 "buffer"
+  !if &lfind "|cmd|diff|tree|" #l4
+    ; run it now, showing its output
+    set-variable %ai-att-chat $buffer-bname
+    ai-att-read #l4 #l1 0 0
+    !if &len #l9
+      !force 0 delete-buffer "*ai-att-text*"
+      ml-write &spr "[AI: %s]" #l9
+      !abort
+    !endif
+    !force 0 delete-buffer "*ai-attachment*"
+    find-buffer "*ai-attachment*"
+    ai-edit-append "*ai-att-text*"
+    !force 0 delete-buffer "*ai-att-text*"
+    -1 buffer-mode "edit"
+    beginning-of-buffer
+    find-buffer %ai-att-chat
+    !force 0 popup-window "*ai-attachment*"
+    !iif &not $status  1 popup-window "*ai-attachment*"
+    ml-write &spr "[AI: %d lines%s]" #l8 &con %ai-att-rc &spr ", exit code %d" %ai-att-rc ""
+    !return
+  !elif &seq #l4 "buffer"
     !if &not &exi &spr ":%s:" #l1
       ml-write &spr "[AI: no buffer %s]" #l1
       !abort
@@ -1598,8 +3096,8 @@ define-macro ai-code-action
 define-macro ai-insert-block
   0x11 set-position "\xa1"
   !if &not &exi :ai-chat
-    !force 0 popup-window "*ai-chat*"
-    !iif &not $status  find-buffer "*ai-chat*"
+    !force 0 popup-window %ai-chat-buf
+    !iif &not $status  find-buffer %ai-chat-buf
     end-of-buffer
   !endif
   ai-find-block
@@ -1610,14 +3108,20 @@ define-macro ai-insert-block
   !endif
   ; an edit block is applied
   set-variable $window-line &sub #l1 1
-  !if &xse @wl "[ \t]*```+[ \t]*edit[ \t]+[^ \t\n].*"
+  set-variable #l5 &xse @wl %ai-edit-fence-x
+  !if &not #l5
+    ai-block-kind &sub #l1 1 #l2
+    set-variable #l5 &len %ai-block-kind
+  !endif
+  set-variable $window-line &sub #l1 1
+  !if #l5
     !if %ai-busy
       0x11 goto-position "\xa1"
       ml-write "[AI: busy, wait for the reply or use ai-cancel]"
       !abort
     !endif
-    set-variable #l3 &sub #l1 2
-    !iif &les #l3 1  set-variable #l3 1
+    ; from the block's opening fence, a closing fence just above it would be taken as an opening
+    set-variable #l3 &sub #l1 1
     set-variable #l4 &add #l2 1
     ai-edit-run #l3 #l4 0
     0x11 goto-position "\xa1"
@@ -1676,7 +3180,7 @@ define-macro ai-insert-block
   set-variable #l3 0
   !while &not &seq &set #l4 &lget %ai-map-roles &inc #l3 1 ""
     set-variable $window-line #l4
-    !if &and &not &gre #l4 #l0 &xse @wl "## AI[ \t]*"
+    !if &and &not &gre #l4 #l0 &xse @wl %ai-ai-re
       set-variable #l1 #l4
       set-variable #l2 0
     !elif &and #l1 &not #l2
@@ -1758,8 +3262,11 @@ define-macro ai-insert-block
   !repeat
     !force search-buffer "me" %ai-fence-regex
     !iif &or &not $status &not &les $window-line #l2  !break
-    !if &not &xse @wl "[ \t]*\\(```+\\)[ \t]*edit[ \t]+\\(.*[^ \t\n]\\)[ \t]*"
-      ; another code block is passed over, an edit block in it is only shown
+    !if &not &xse @wl %ai-edit-fence-x
+      ; another code block is passed over, an edit block in it is only shown. With
+      ; %ai-edit-lenient a diff, or SEARCH and REPLACE changes under a line naming the file, is
+      ; taken as changes
+      set-variable #l5 $window-line
       ai-fence-line @wl ""
       set-variable #l3 %ai-fence
       !while &len #l3
@@ -1768,21 +3275,42 @@ define-macro ai-insert-block
         !if &or &not $status &not &les $window-line #l2
           set-variable $window-line #l2
           set-variable #l3 ""
+          set-variable #l5 0
         !else
           ai-fence-line @wl #l3
           set-variable #l3 %ai-fence
         !endif
       !done
+      !if #l5
+        set-variable #l6 $window-line
+        ai-block-kind #l5 #l6
+        !if &len %ai-block-kind
+          set-variable #p8 &add #p8 1
+          set-variable #l7 "|"
+          !repeat
+            forward-line
+            !iif &not &xse @wl "(edit \\([0-9]+\\) [a-z]+.*"  !break
+            set-variable #l7 &cat #l7 &cat @s1 "|"
+          !done
+          !if &seq %ai-block-kind "\x01diff"
+            ai-edit-diff #l5 #l6 #l7
+          !else
+            ai-edit-block %ai-block-kind #l5 #l6 #l7
+          !endif
+          set-variable $window-line #l6
+        !endif
+      !endif
       end-of-line
       !continue
     !endif
     set-variable #l3 @s1
-    set-variable #l4 @s2
+    set-variable #l4 @s3
+    !iif &xse #l4 "\\(path\\|file\\)[ \t]*=[ \t]*\\(.*\\)"  set-variable #l4 @s2
     set-variable #l5 $window-line
     set-variable #p8 &add #p8 1
     set-variable #l6 #l2
     set-variable #l8 1
-    !force search-buffer "me" &spr "^[ \t]*%s`*[ \t]*$" #l3
+    !force search-buffer "me" &spr "^[ \t]*%s%s*[ \t]*$" #l3 &lef #l3 1
     !if &and $status &les $window-line #l2
       set-variable #l6 $window-line
       set-variable #l8 0
@@ -1825,6 +3353,541 @@ define-macro ai-insert-block
     end-of-line
   !done
   set-variable #p9 #l9
+!emacro
+
+; set %ai-block-kind to how the code block from line @1 of the current chat to its closing fence
+; on line @2 changes files when it is not an edit block: "\x01diff" for a diff, with
+; %ai-block-name the file named above it, or the name of the file written above a block of SEARCH
+; and REPLACE changes, else "". Only with %ai-edit-lenient
+0 define-macro ai-block-kind
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable %ai-block-kind ""
+  set-variable %ai-block-name ""
+  !iif &not %ai-edit-lenient  !return
+  0xc0 set-position "\xaa"
+  set-variable #l3 ""
+  !if &gre #l1 1
+    set-variable $window-line &sub #l1 1
+    ai-name-above @wl
+    set-variable #l3 #l9
+  !endif
+  set-variable $window-line #l1
+  !force search-buffer "me" "^@@ -[0-9]"
+  !if &and $status &les $window-line #l2
+    set-variable $window-line #l1
+    !force search-buffer "me" "^\\+\\+\\+ [^ \t\n]"
+    !if &or &len #l3 &and $status &les $window-line #l2
+      set-variable %ai-block-kind "\x01diff"
+      set-variable %ai-block-name #l3
+    !endif
+  !elif &len #l3
+    set-variable $window-line #l1
+    !force search-buffer "me" "^<<<<<<<+[ \t]*SEARCH[ \t]*$"
+    !iif &and $status &les $window-line #l2  set-variable %ai-block-kind #l3
+  !endif
+  0xc0 goto-position "\xaa"
+!emacro
+
+; set #p9 to the file name of the ---/+++ line of text @1, without its a/ or b/ and any date
+0 define-macro ai-diff-name
+  set-variable #l1 &rig @1 4
+  !iif &sin "\t" #l1  set-variable #l1 &lef #l1 &sub &sin "\t" #l1 1
+  set-variable #l1 &trb #l1
+  !iif &xse #l1 "[ab]/.*"  set-variable #l1 &rig #l1 2
+  set-variable #p9 #l1
+!emacro
+
+; list the changes of the diff in the block from line @1 of the current chat to its closing fence
+; on line @2 in *ai-edits*, a hunk each, as ai-edit-block does for an edit block. The changes in
+; the | list @3 have a status
+0 define-macro ai-edit-diff
+  set-variable #l0 $buffer-bname
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  ; #l4 the file, #l5 the change's number, #l6 the first line of a hunk's text, #l7 d, or dn for
+  ; a new file and dx for a file removed
+  set-variable #l4 %ai-block-name
+  set-variable #l5 0
+  set-variable #l6 0
+  set-variable #l7 "d"
+  set-variable $window-line &add #l1 1
+  !repeat
+    ; a hunk ends at the next hunk or file, at the end of the block or at a line that is not one of
+    ; its lines
+    set-variable #l8 &equ $window-line #l2
+    !if &not #l8
+      set-variable #l9 @wc
+      !if &xse @wl "\\(@@ \\|diff \\|index \\).*"
+        set-variable #l8 2
+      !elif &and &seq #l9 "-" &xse @wl "--- .*"
+        forward-line
+        set-variable #l8 &xse @wl "\\+\\+\\+ .*"
+        backward-line
+        !iif #l8  set-variable #l8 3
+      !elif &not &sin #l9 " -+\\\n"
+        set-variable #l8 1
+      !endif
+    !endif
+    !if &and #l8 #l6
+      set-variable #l5 &add #l5 1
+      !if &not &lfind #l3 #l5
+        set-variable #l9 &spr "\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t\n" #l4 #l6 $window-line #l6 $window-line #l2 #l5 #l7
+        find-buffer "*ai-edits*"
+        end-of-buffer
+        insert-string #l9
+        find-buffer #l0
+        set-variable #p9 &add #p9 1
+      !endif
+      set-variable #l6 0
+    !endif
+    !iif &equ $window-line #l2  !break
+    !if &equ #l8 3
+      ; a file's ---/+++ lines
+      set-variable #l7 &con &xse @wl "--- /dev/null[ \t]*.*" "dn" "d"
+      ai-diff-name @wl
+      set-variable #l4 #l9
+      forward-line
+      !if &xse @wl "\\+\\+\\+ /dev/null[ \t]*.*"
+        set-variable #l7 "dx"
+      !else
+        ai-diff-name @wl
+        set-variable #l4 #l9
+      !endif
+    !elif &xse @wl "@@ .*"
+      set-variable #l6 &add $window-line 1
+    !endif
+    forward-line
+  !done
+!emacro
+
+; keep the lines of the diff hunk in the current buffer that are context or start with @1, without
+; that first character
+0 define-macro ai-edit-hunk-side
+  set-variable #l1 @1
+  beginning-of-buffer
+  !while &not &seq @wc ""
+    set-variable #l2 @wc
+    !if &or &seq #l2 " " &seq #l2 #l1
+      forward-delete-char
+      forward-line
+    !elif &seq #l2 "\n"
+      ; a blank line of context that lost its space
+      forward-line
+    !else
+      set-mark
+      forward-line
+      -1 kill-region
+    !endif
+  !done
+!emacro
+
+; fill *ai-edit-s* & *ai-edit-r* with the SEARCH & REPLACE text of change @1, an *ai-edits* record
+; whose chat lines are now @2 lines further on. Sets #p8 to why it cannot be applied, else ""
+0 define-macro ai-edit-fetch
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #p8 ""
+  set-variable #l3 &lget #l1 8
+  !if &not &lget #l1 2
+    set-variable #p8 "failed, it is not a complete SEARCH and REPLACE"
+  !elif &seq #l3 "dx"
+    set-variable #p8 "failed, removing a file is not supported"
+  !elif &seq &lef #l3 1 "d"
+    set-variable #l4 &add &lget #l1 2 #l2
+    set-variable #l5 &add &lget #l1 3 #l2
+    ai-edit-copy #l4 #l5 "*ai-edit-s*"
+    ai-edit-copy #l4 #l5 "*ai-edit-r*"
+    set-variable #l0 $buffer-bname
+    find-buffer "*ai-edit-r*"
+    ai-edit-hunk-side "+"
+    find-buffer "*ai-edit-s*"
+    ai-edit-hunk-side "-"
+    end-of-buffer
+    set-variable #l6 &gre $window-line 1
+    find-buffer #l0
+    !iif &and &seq #l3 "d" &not #l6  set-variable #p8 "failed, the hunk has no lines to find in the file"
+  !else
+    ai-edit-copy &add &lget #l1 2 #l2 &add &lget #l1 3 #l2 "*ai-edit-s*"
+    ai-edit-copy &add &lget #l1 4 #l2 &add &lget #l1 5 #l2 "*ai-edit-r*"
+  !endif
+!emacro
+
+; Review all the changes of a reply as one diff in *ai-diff*, where each is kept or rejected
+; before any is applied
+
+; add lines of buffer @1 to the end of *ai-diff*, from line @2 for @3 lines (-1 for the rest),
+; each after text @4
+0 define-macro ai-diff-add
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l4 @4
+  set-variable #l0 $buffer-bname
+  find-buffer #l1
+  !if &les #l3 0
+    end-of-buffer
+    set-variable #l3 &sub $window-line #l2
+  !endif
+  !if &gre #l3 0
+    set-variable $window-line #l2
+    set-mark
+    set-variable $window-line &add #l2 #l3
+    set-variable #l5 $system
+    set-variable $system &bor #l5 0x800000
+    copy-region
+    find-buffer "*ai-diff*"
+    end-of-buffer
+    set-variable #l6 $window-line
+    !force yank
+    -1 yank
+    set-variable $system #l5
+    set-variable $window-line #l6
+    !while &not &seq @wc ""
+      insert-string #l4
+      forward-line
+      beginning-of-line
+    !done
+  !endif
+  find-buffer #l0
+!emacro
+
+; add line of text @1 to *ai-diff*
+0 define-macro ai-diff-line
+  set-variable #l1 @1
+  set-variable #l0 $buffer-bname
+  find-buffer "*ai-diff*"
+  end-of-buffer
+  insert-string &cat #l1 "\n"
+  find-buffer #l0
+!emacro
+
+; add to *ai-diff* how change %ai-dc-rec, an *ai-edits* record, the %ai-dc-i of %ai-dc-n, would
+; change its file. The current buffer is the chat
+0 define-macro ai-diff-change
+  set-variable #l0 $buffer-bname
+  set-variable %ai-dc-name &lget %ai-dc-rec 1
+  set-variable %ai-dc-head &spr "[ ] edit %d of %d, %s" %ai-dc-i %ai-dc-n %ai-dc-name
+  ai-edit-fetch %ai-dc-rec 0
+  !if &len #l8
+    ai-diff-line &spr "%s: %s\n" %ai-dc-head &rep #l8 "failed, " "it fails, "
+    !return
+  !endif
+  ; sets #l1 to file or buffer, #l2 its name, #l3 its ranges, #l4 whether attached
+  ai-edit-target %ai-dc-name
+  !if &len #l8
+    ai-diff-line &spr "%s: it fails, %s could be %s\n" %ai-dc-head %ai-dc-name #l8
+    !return
+  !endif
+  set-variable %ai-dc-note &con #l4 "" ", not attached so you are asked first"
+  find-buffer "*ai-edit-s*"
+  end-of-buffer
+  set-variable #l5 &sub $window-line 1
+  find-buffer "*ai-edit-r*"
+  end-of-buffer
+  set-variable #l7 &sub $window-line 1
+  find-buffer #l0
+  ai-edit-buffer #l1 #l2
+  set-variable #l6 #l9
+  !if &not #l5
+    ; an empty SEARCH creates the file, or fills an empty one
+    !if &len #l6
+      find-buffer #l6
+      end-of-buffer
+      set-variable #l8 &or &gre $window-line 1 $window-col
+      find-buffer #l0
+      !if #l8
+        ai-diff-line &spr "%s: it fails, the SEARCH text is empty but %s is not\n" %ai-dc-head %ai-dc-name
+        !return
+      !endif
+    !elif &seq #l1 "buffer"
+      ai-diff-line &spr "%s: it fails, there is no %s\n" %ai-dc-head %ai-dc-name
+      !return
+    !elif &not &seq &stat "t" #l2 "X"
+      ai-diff-line &spr "%s: it fails, %s is not a file\n" %ai-dc-head %ai-dc-name
+      !return
+    !endif
+    ai-diff-line &spr "%s, %s it%s" %ai-dc-head &con &len #l6 "fills" "creates" %ai-dc-note
+    ai-diff-line &spr "--- /dev/null\n+++ %s\n@@ -0,0 +1,%d @@" %ai-dc-name #l7
+    ai-diff-add "*ai-edit-r*" 1 -1 "+"
+    ai-diff-line ""
+    !return
+  !endif
+  !if &not &len #l6
+    ai-diff-line &spr "%s: it fails, there is no %s\n" %ai-dc-head %ai-dc-name
+    !return
+  !endif
+  ; sets #l1 to the line it matched, #l2 the number of places and #l3 the comparison
+  ai-edit-match #l6 #l3 #l5
+  !if &not #l1
+    find-buffer #l6
+    set-variable #l8 &bmo "narrow"
+    find-buffer #l0
+    !if #l2
+      ai-diff-line &spr "%s: it fails, the SEARCH text matches %d places\n" %ai-dc-head #l2
+    !elif #l8
+      ai-diff-line &spr "%s: it fails, the SEARCH text is not in the lines shown, it has collapsed parts\n" %ai-dc-head
+    !else
+      ai-diff-line &spr "%s: it fails, the SEARCH text is not in it\n" %ai-dc-head
+    !endif
+    !return
+  !endif
+  !iif &equ #l3 3  ai-edit-indent #l6 #l1 #l5
+  find-buffer #l6
+  ai-edit-copy #l1 &add #l1 #l5 "*ai-edit-o*"
+  set-variable $window-line #l1
+  set-variable #l4 $window-aline
+  end-of-buffer
+  set-variable #l8 $window-line
+  find-buffer #l0
+  ai-edit-formats "*ai-edit-o*"
+  set-variable #l2 #l9
+  ai-edit-formats "*ai-edit-r*"
+  !iif &and &len #l2 &not &seq #l2 #l9  set-variable %ai-dc-note &cat %ai-dc-note ", its % formats look changed"
+  ai-diff-line &spr "%s line %d%s" %ai-dc-head #l4 %ai-dc-note
+  ai-diff-line &spr "--- %s\n+++ %s\n@@ -%d,%d +%d,%d @@" %ai-dc-name %ai-dc-name #l4 #l5 #l4 #l7
+  ; with two lines either side
+  set-variable #l2 &sub #l1 2
+  !iif &les #l2 1  set-variable #l2 1
+  ai-diff-add #l6 #l2 &sub #l1 #l2 " "
+  ai-diff-add "*ai-edit-o*" 1 -1 "-"
+  ai-diff-add "*ai-edit-r*" 1 -1 "+"
+  set-variable #l2 &add #l1 #l5
+  set-variable #l3 &sub #l8 #l2
+  !iif &gre #l3 2  set-variable #l3 2
+  ai-diff-add #l6 #l2 #l3 " "
+  ai-diff-line ""
+!emacro
+
+; show the pending changes of the reply at or before the point in the chat, or of the last reply
+; from any other buffer, as one diff in which each is kept (y) or rejected (n) before C-c C-c
+; applies those decided. The keys are letters as a key's case is not told apart
+define-macro ai-review-edits
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  !if &not &exi :ai-chat
+    !force 0 popup-window %ai-chat-buf
+    !if &not $status
+      ml-write "[AI: there is no chat]"
+      !abort
+    !endif
+    end-of-buffer
+  !endif
+  set-alpha-mark "\xa8"
+  ai-edit-reply
+  goto-alpha-mark "\xa8"
+  !if &not #l1
+    ml-write "[AI: no reply to review]"
+    !abort
+  !endif
+  set-variable %ai-edit-chat $buffer-bname
+  set-variable %ai-diff-line #l1
+  ai-att-scan
+  ai-edit-list #l1 #l2
+  !if &not #l9
+    !force 0 delete-buffer "*ai-edits*"
+    !force 0 delete-buffer "*ai-att*"
+    goto-alpha-mark "\xa8"
+    ml-write &con #l8 "[AI: each change has a status line, delete one to apply its change again]" "[AI: no edits to review]"
+    !abort
+  !endif
+  set-variable %ai-dc-n #l9
+  !force 0 delete-buffer "*ai-diff*"
+  find-buffer "*ai-diff*"
+  insert-string "AI edits: y keeps a change, n rejects it and u undecides it, a keeps the rest and r rejects\nthe rest, tab moves on, C-c C-c applies those decided and q quits. Lines are as they are now.\n\n"
+  find-buffer %ai-edit-chat
+  set-variable %ai-dc-i 0
+  !while &les %ai-dc-i %ai-dc-n
+    set-variable %ai-dc-i &add %ai-dc-i 1
+    find-buffer "*ai-edits*"
+    set-variable $window-line %ai-dc-i
+    set-variable %ai-dc-rec @wl
+    find-buffer %ai-edit-chat
+    ai-diff-change
+  !done
+  ; the changes as they were, to check on applying them
+  find-buffer "*ai-edits*"
+  end-of-buffer
+  set-variable #l3 $window-line
+  ai-edit-copy 1 #l3 "*ai-diff-edits*"
+  !force 0 delete-buffer "*ai-edits*"
+  !force 0 delete-buffer "*ai-edit-s*"
+  !force 0 delete-buffer "*ai-edit-r*"
+  !force 0 delete-buffer "*ai-edit-o*"
+  !force 0 delete-buffer "*ai-att*"
+  find-buffer %ai-edit-chat
+  goto-alpha-mark "\xa8"
+  set-variable #l0 %ai-edit-chat
+  find-buffer "*ai-diff*"
+  !force major-mode "diff"
+  set-variable :ai-diff-chat #l0
+  set-variable :ai-diff-line %ai-diff-line
+  buffer-bind-key ai-diff-keep "y"
+  buffer-bind-key ai-diff-reject "n"
+  buffer-bind-key ai-diff-undecide "u"
+  buffer-bind-key ai-diff-keep-rest "a"
+  buffer-bind-key ai-diff-reject-rest "r"
+  buffer-bind-key ai-diff-next "tab"
+  buffer-bind-key ai-diff-prev "S-tab"
+  buffer-bind-key ai-diff-apply "C-c C-c"
+  buffer-bind-key ai-diff-quit "q"
+  -1 buffer-mode "edit"
+  find-buffer #l0
+  !force 0 popup-window "*ai-diff*"
+  !iif &not $status  1 popup-window "*ai-diff*"
+  beginning-of-buffer
+  ai-diff-next
+  ml-write &spr "[AI: %d edit%s to review, y keeps, n rejects, C-c C-c applies]" %ai-dc-n &con &equ %ai-dc-n 1 "" "s"
+!emacro
+
+; move to the next change in *ai-diff*
+0 define-macro ai-diff-next
+  end-of-line
+  !force search-buffer "me" "^\\[.\\] edit [0-9]+ of"
+  !if $status
+    beginning-of-line
+  !else
+    ml-write "[AI: no more changes]"
+  !endif
+!emacro
+
+; move to the previous change in *ai-diff*
+0 define-macro ai-diff-prev
+  beginning-of-line
+  !force search-buffer "bme" "^\\[.\\] edit [0-9]+ of"
+  !iif &not $status  ml-write "[AI: no change before]"
+!emacro
+
+; mark the change at the point with @1, and go to the next
+0 define-macro ai-diff-mark
+  set-variable #l1 @1
+  end-of-line
+  !force search-buffer "bme" "^\\[.\\] edit [0-9]+ of"
+  !if &not $status
+    !force search-buffer "me" "^\\[.\\] edit [0-9]+ of"
+    !iif &not $status  !return
+  !endif
+  beginning-of-line
+  forward-char
+  forward-delete-char
+  insert-string #l1
+  -1 buffer-mode "edit"
+  ai-diff-next
+!emacro
+
+0 define-macro ai-diff-keep
+  ai-diff-mark "y"
+!emacro
+
+0 define-macro ai-diff-reject
+  ai-diff-mark "n"
+!emacro
+
+0 define-macro ai-diff-undecide
+  ai-diff-mark " "
+!emacro
+
+; mark the changes not yet decided with @1
+0 define-macro ai-diff-rest
+  set-variable #l1 @1
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" "^\\[ \\] edit [0-9]+ of"
+    !iif &not $status  !break
+    beginning-of-line
+    forward-char
+    forward-delete-char
+    insert-string #l1
+  !done
+  -1 buffer-mode "edit"
+!emacro
+
+0 define-macro ai-diff-keep-rest
+  ai-diff-rest "y"
+!emacro
+
+0 define-macro ai-diff-reject-rest
+  ai-diff-rest "n"
+!emacro
+
+0 define-macro ai-diff-quit
+  set-variable #l0 :ai-diff-chat
+  !force 0 delete-buffer "*ai-diff-edits*"
+  0 delete-buffer "*ai-diff*"
+  !force find-buffer #l0
+!emacro
+
+; apply the changes kept in *ai-diff* and mark those rejected, leaving those not decided
+0 define-macro ai-diff-apply
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  set-variable #l0 :ai-diff-chat
+  set-variable #l1 :ai-diff-line
+  set-variable %ai-diff-decide "|"
+  set-variable #l3 0
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" "^\\[\\(.\\)\\] edit [0-9]+ of"
+    !iif &not $status  !break
+    set-variable %ai-diff-decide &spr "%s%s|" %ai-diff-decide &slo @s1
+    !iif &not &seq @s1 " "  set-variable #l3 1
+  !done
+  !if &not #l3
+    ml-write "[AI: no change is decided, y keeps one and n rejects it]"
+    !abort
+  !endif
+  !if &not &exi &spr ":%s:" #l0
+    ml-write "[AI: the chat has gone]"
+    !abort
+  !endif
+  ; the changes must be those reviewed
+  find-buffer #l0
+  set-variable $window-line #l1
+  ai-edit-reply
+  set-variable #l4 #l1
+  set-variable #l5 #l2
+  !if #l4
+    set-variable %ai-edit-chat #l0
+    ai-att-scan
+    ai-edit-list #l4 #l5
+    set-variable #l6 &equ #l9 %ai-dc-n
+    !force 0 delete-buffer "*ai-att*"
+    !if #l6
+      set-variable #l7 0
+      !while &and #l6 &les #l7 %ai-dc-n
+        set-variable #l7 &add #l7 1
+        find-buffer "*ai-edits*"
+        set-variable $window-line #l7
+        set-variable #l8 @wl
+        find-buffer "*ai-diff-edits*"
+        set-variable $window-line #l7
+        set-variable #l6 &seq @wl #l8
+      !done
+    !endif
+    !force 0 delete-buffer "*ai-edits*"
+  !else
+    set-variable #l6 0
+  !endif
+  find-buffer "*ai-diff*"
+  !if &not #l6
+    ml-write "[AI: the reply has changed since, review it again]"
+    !abort
+  !endif
+  find-buffer #l0
+  set-variable $window-line #l4
+  set-variable %ai-edit-decide %ai-diff-decide
+  !force ai-edit-run #l4 #l5 2
+  set-variable %ai-edit-decide ""
+  !force 0 delete-buffer "*ai-diff-edits*"
+  !force 0 delete-buffer "*ai-diff*"
+  find-buffer #l0
+  !force 0 popup-window #l0
+  ml-write %ai-edit-msg
 !emacro
 
 ; copy lines @1 to @2 (exclusive) of the current buffer into temporary buffer @3
@@ -1899,7 +3962,9 @@ define-macro ai-insert-block
     beginning-of-buffer
     !while &not &seq @wc ""
       set-variable #l7 @wl
-      !if &equ #l6 1
+      !if &not &lfind "|file|buffer|" &lget #l7 1
+        set-variable #l8 0
+      !elif &equ #l6 1
         set-variable #l8 &seq &lget #l7 6 #l1
       !else
         set-variable #l8 &cat "/" &lget #l7 2
@@ -1931,6 +3996,12 @@ define-macro ai-insert-block
     set-variable #l2 "file"
     set-variable #l3 ""
     !if &not &sin &lef #l1 1 "/~"
+      ; relative to the directory of an attached tree, else to where the attachments' labels start
+      beginning-of-buffer
+      !while &not &seq @wc ""
+        !iif &and &seq #l3 "" &seq &lget @wl 1 "tree"  set-variable #l3 &cat &lget @wl 2 "/"
+        forward-line
+      !done
       beginning-of-buffer
       !while &not &seq @wc ""
         !if &and &seq #l3 "" &seq &lget @wl 1 "file"
@@ -2434,7 +4505,7 @@ define-macro ai-insert-block
   set-variable #l7 &and &len #l7 &not &seq #l7 #l9
   find-buffer %ai-edit-chat
   ; accepting all the changes does not accept one that changes the % formats
-  !if &and %ai-edit-auto &not #l7
+  !if &or &equ %ai-edit-auto 2 &and %ai-edit-auto &not #l7
     set-variable #l9 "y"
   !else
     !force 0 popup-window #l1
@@ -2604,16 +4675,14 @@ define-macro ai-insert-block
   set-variable #l7 &add &lget @1 6 @2
   set-variable #l5 &lget @1 1
   set-variable #l9 ""
-  !if &not &lget @1 2
-    set-variable #l8 "failed, it is not a complete SEARCH and REPLACE"
+  !if %ai-edit-reject-this
+    set-variable #l8 "rejected"
   !else
-    set-variable #l1 &add &lget @1 2 @2
-    set-variable #l2 &add &lget @1 3 @2
-    ai-edit-copy #l1 #l2 "*ai-edit-s*"
-    set-variable #l1 &add &lget @1 4 @2
-    set-variable #l2 &add &lget @1 5 @2
-    ai-edit-copy #l1 #l2 "*ai-edit-r*"
-    ai-edit-apply #l5 #l6
+    ; sets #l8 to why it cannot be applied
+    set-variable #l4 @1
+    set-variable #l3 @2
+    ai-edit-fetch #l4 #l3
+    !iif &not &len #l8  ai-edit-apply #l5 #l6
   !endif
   find-buffer %ai-edit-chat
   ; the status lines are kept in the order of the changes
@@ -2675,7 +4744,15 @@ define-macro ai-insert-block
       set-variable #l5 0
       set-variable #l6 &lget #l7 6
     !endif
+    ; from the review of the changes as a diff, one not decided is left for later
+    set-variable %ai-edit-reject-this 0
+    !if &len %ai-edit-decide
+      set-variable #l8 &lget %ai-edit-decide #l3
+      !iif &seq #l8 " "  !continue
+      set-variable %ai-edit-reject-this &seq #l8 "n"
+    !endif
     ai-edit-change #l7 #l4 #l3
+    set-variable %ai-edit-reject-this 0
     set-variable #l5 &add #l5 1
     !iif &seq #l9 "q"  !break
   !done
@@ -2704,7 +4781,7 @@ define-macro ai-apply-edits
   !force -1 create-callback ai-edit-review
   0x01 set-position "\xa1"
   !if &not &exi :ai-chat
-    !force 0 popup-window "*ai-chat*"
+    !force 0 popup-window %ai-chat-buf
     !if &not $status
       ml-write "[AI: there is no chat]"
       !abort
@@ -2912,7 +4989,7 @@ define-macro ai-edit
     ; only the chat's attachments, which need to be there
     ai-att-scan
     !force 0 delete-buffer "*ai-att*"
-    !if &not #l9
+    !if &not #l8
       ml-write "[AI: attach the code to change first, C-c f]"
       !abort
     !endif
@@ -2971,23 +5048,955 @@ define-macro ai-edit
   0x01 goto-position "\xa1"
 !emacro
 
+; Saved chats: each chat is written to %ai-chat-dir as it is sent and replied to
+
+; set #p9 to the file for the chat in the current buffer, named by when it starts and the first
+; line of its first question
+0 define-macro ai-chat-file
+  set-variable #l1 $time
+  set-variable #l2 &spr "%s-%s-%s-%s%s" &mid #l1 0 4 &mid #l1 7 2 &mid #l1 9 2 &mid #l1 12 2 &mid #l1 14 2
+  set-variable #l3 ""
+  ai-chat-map
+  set-variable #l4 0
+  !while &and &not &len #l3 &not &seq &set #l5 &lget %ai-map-roles &inc #l4 1 ""
+    set-variable $window-line #l5
+    !if &xse @wl %ai-you-re
+      !repeat
+        !force forward-line
+        !iif &or &not $status &seq @wc ""  !break
+        !iif &xse @wl %ai-role-re  !break
+        !if &not &or &xse @wl "[ \t]*" &xse @wl %ai-att-line
+          set-variable #l3 @wl
+          !break
+        !endif
+      !done
+    !endif
+  !done
+  set-variable #l3 &slo &xrep #l3 "[^A-Za-z0-9]+" "-"
+  !iif &gre &len #l3 40  set-variable #l3 &lef #l3 40
+  !while &seq &lef #l3 1 "-"
+    set-variable #l3 &rig #l3 1
+  !done
+  !while &seq &rig #l3 &sub &len #l3 1 "-"
+    set-variable #l3 &lef #l3 &sub &len #l3 1
+  !done
+  set-variable #l6 %ai-chat-dir
+  !iif &not &seq &rig #l6 &sub &len #l6 1 "/"  set-variable #l6 &cat #l6 "/"
+  set-variable #l7 &spr "%s%s%s" #l6 #l2 &con &len #l3 &cat "-" #l3 ""
+  ; another chat started in the same minute
+  set-variable #l8 &cat #l7 ".md"
+  set-variable #l9 1
+  !while &not &seq &stat "t" #l8 "X"
+    set-variable #l9 &add #l9 1
+    set-variable #l8 &spr "%s-%d.md" #l7 #l9
+  !done
+  set-variable #p9 #l8
+!emacro
+
+; save the chat in the current buffer, once it has a reply, to its file in %ai-chat-dir
+0 define-macro ai-chat-save
+  !iif &not %ai-chat-save  !return
+  !iif &not &exi :ai-chat  !return
+  set-variable #l0 $buffer-bname
+  0x0c0 set-position "\xab"
+  beginning-of-buffer
+  !force search-buffer "me" &spr "^%s$" %ai-ai-re
+  !if &not $status
+    0x0c0 goto-position "\xab"
+    !return
+  !endif
+  !if &not &exi :ai-file
+    ai-chat-file
+    set-variable :ai-file #l9
+  !endif
+  set-variable #l1 :ai-file
+  set-variable #l2 &lef #l1 &rsin "/" #l1
+  !iif &not &seq &stat "t" #l2 "D"  !force 0x100 file-op #l2
+  beginning-of-buffer
+  set-mark
+  end-of-buffer
+  set-variable #l3 $system
+  set-variable $system &bor #l3 0x800000
+  copy-region
+  ai-temp-buffer "*ai-save*"
+  !force yank
+  -1 yank
+  set-variable $system #l3
+  !force 0 write-buffer #l1
+  set-variable #l4 $status
+  0 delete-buffer $buffer-bname
+  find-buffer #l0
+  0x0c0 goto-position "\xab"
+  !iif &not #l4  ml-write &spr "[AI: could not save the chat to %s]" #l1
+!emacro
+
+; open a saved chat in the chat window, the chat there is saved first. It is chosen from the
+; files in %ai-chat-dir, the newest first
+define-macro ai-chat-open
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  set-variable #l0 $buffer-bname
+  set-variable #l2 %ai-chat-dir
+  !iif &not &seq &rig #l2 &sub &len #l2 1 "/"  set-variable #l2 &cat #l2 "/"
+  ai-temp-buffer "*ai-chats*"
+  !if &seq &stat "t" #l2 "D"
+    set-variable $file-names &cat #l2 ".*\\.md"
+    !while &not &seq &set #l3 $file-names ""
+      beginning-of-buffer
+      insert-string &cat #l3 "\n"
+    !done
+  !endif
+  beginning-of-buffer
+  set-variable #l3 @wl
+  find-buffer #l0
+  !if &seq #l3 ""
+    ml-write &spr "[AI: there are no saved chats in %s]" #l2
+    !abort
+  !endif
+  !force set-variable #l1 @ml1a "Open AI chat" #l3 "*ai-chats*"
+  set-variable #l4 $status
+  !force 0 delete-buffer "*ai-chats*"
+  !iif &not #l4  !abort
+  set-variable #l1 &cat #l2 #l1
+  !if &not &seq &stat "t" #l1 "R"
+    ml-write &spr "[AI: no file %s]" #l1
+    !abort
+  !endif
+  ai-chat
+  !force ai-chat-save
+  beginning-of-buffer
+  set-mark
+  end-of-buffer
+  !force -1 kill-region
+  insert-file #l1
+  set-variable :ai-file #l1
+  !force unset-variable :ai-tokens-in
+  !force unset-variable :ai-tokens-out
+  ; ready for the next question
+  ai-chat-map
+  set-variable #l5 %ai-map-last
+  !iif #l5  set-variable $window-line #l5
+  !if &not &and #l5 &xse @wl %ai-you-re
+    ai-chat-close-fence
+    ai-chat-separate
+    insert-string "## You\n\n"
+  !endif
+  end-of-buffer
+  ml-write &spr "[AI: opened %s]" &rig #l1 &rsin "/" #l1
+!emacro
+
+; branch the chat at the point: a new chat holding this one up to the end of the part at the
+; point, to go on from there another way
+define-macro ai-fork
+  !if &not &exi :ai-chat
+    ml-write "[AI: run this in a chat, at the part to branch after]"
+    !abort
+  !endif
+  set-variable #l0 $buffer-bname
+  set-variable #l1 $window-line
+  ai-chat-map
+  set-variable #l2 0
+  set-variable #l3 0
+  !while &not &seq &set #l4 &lget %ai-map-roles &inc #l3 1 ""
+    !if &gre #l4 #l1
+      set-variable #l2 #l4
+      !break
+    !endif
+  !done
+  !iif &not #l2  set-variable #l2 $window-eline
+  ; the first free name
+  set-variable #l5 2
+  !while &exi &spr ":*ai-chat:%d*:" #l5
+    set-variable #l5 &add #l5 1
+  !done
+  set-variable #l6 &spr "*ai-chat:%d*" #l5
+  beginning-of-buffer
+  set-mark
+  set-variable $window-line #l2
+  set-variable #l7 $system
+  set-variable $system &bor #l7 0x800000
+  copy-region
+  set-variable $window-line #l1
+  find-buffer #l6
+  !force yank
+  -1 yank
+  set-variable $system #l7
+  ai-chat-setup
+  ; a branch at a question leaves it to be changed and sent, else a new question is started
+  ai-chat-map
+  set-variable #l8 %ai-map-last
+  !iif #l8  set-variable $window-line #l8
+  !iif &not &and #l8 &xse @wl %ai-you-re  ai-chat-question
+  set-variable %ai-chat-buf #l6
+  find-buffer #l0
+  !force 0 popup-window #l6
+  !iif &not $status  1 popup-window #l6
+  end-of-buffer
+  ml-write &spr "[AI: branched into %s, ai-chat with an argument switches chats]" #l6
+!emacro
+
+; $result is 1 when the part of the current chat from role line @1 to line @2 (exclusive) has
+; text other than blank lines
+0 define-macro ai-part-has-text
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable $result 0
+  set-variable $window-line &add #l1 1
+  !while &les $window-line #l2
+    !if &not &xse @wl "[ \t]*"
+      set-variable $result 1
+      !return
+    !endif
+    !force forward-line
+    !iif &not $status  !return
+  !done
+!emacro
+
+; ask the last question again, the reply to it and anything after are replaced
+define-macro ai-retry
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  !iif &not &exi :ai-chat  ai-chat
+  ai-chat-map
+  ; the last question with text that has a reply after it
+  set-variable #l1 0
+  set-variable #l2 0
+  set-variable #l3 0
+  set-variable #l6 0
+  !while &not &seq &set #l4 &lget %ai-map-roles &inc #l3 1 ""
+    set-variable #l5 &lget %ai-map-roles &add #l3 1
+    !iif &seq #l5 ""  set-variable #l5 &add $window-eline 1
+    set-variable $window-line #l4
+    !if &xse @wl %ai-you-re
+      ai-part-has-text #l4 #l5
+      !if $result
+        set-variable #l1 #l4
+        set-variable #l2 &con &les #l5 $window-eline #l5 0
+        set-variable #l6 0
+      !endif
+    !elif #l1
+      set-variable #l6 1
+    !endif
+  !done
+  !if &not &and #l1 &and #l2 #l6
+    ml-write "[AI: no question with a reply to ask again, C-c C-c sends a new one]"
+    !abort
+  !endif
+  ; a question written since would be lost
+  set-variable $window-line %ai-map-last
+  !if &and &xse @wl %ai-you-re &gre %ai-map-last #l2
+    ai-part-has-text %ai-map-last &add $window-eline 1
+    !if $result
+      ml-write "[AI: the last question has not been sent, C-c C-c sends it]"
+      !abort
+    !endif
+  !endif
+  set-variable $window-line #l2
+  !force search-buffer "me" "^(edit [0-9]+ applied"
+  !if $status
+    !if &not &iseq @mc1 "Its edits were applied, ask again anyway (y/n)? " "yYnN" "y"
+      !abort
+    !endif
+  !endif
+  set-variable $window-line #l2
+  set-mark
+  end-of-buffer
+  -1 kill-region
+  set-variable %ai-tool-round 0
+  ai-start
+!emacro
+
+; quote the selected text in the question being written, as > lines
+define-macro ai-quote
+  ai-get-region
+  !if &not #l9
+    ml-write "[AI: select the text to quote first]"
+    !abort
+  !endif
+  set-variable #l5 &exi :ai-chat
+  set-variable #l0 $buffer-bname
+  0x53f set-position "\xa1"
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  set-mark
+  set-variable $window-line #l3
+  set-variable $window-col #l4
+  set-variable #l6 $system
+  set-variable $system &bor #l6 0x800000
+  copy-region
+  goto-position "\xa1"
+  ai-temp-buffer "*ai-quote*"
+  !force yank
+  -1 yank
+  set-variable $system #l6
+  ; the last line with text
+  end-of-buffer
+  set-variable #l8 0
+  !while &gre $window-line 1
+    backward-line
+    !if &not &xse @wl "[ \t]*"
+      set-variable #l8 $window-line
+      !break
+    !endif
+  !done
+  !if &not #l8
+    !force 0 delete-buffer "*ai-quote*"
+    find-buffer #l0
+    ml-write "[AI: nothing to quote]"
+    !abort
+  !endif
+  ; each line up to it starts with >, the rest is dropped
+  beginning-of-buffer
+  !while &not &gre $window-line #l8
+    insert-string &con &xse @wl "[ \t]*" ">" "> "
+    forward-line
+    beginning-of-line
+  !done
+  set-mark
+  end-of-buffer
+  !force -1 kill-region
+  0x01 set-position "\xa1"
+  ai-chat
+  ai-chat-map
+  set-variable #l1 %ai-map-last
+  !iif #l1  set-variable $window-line #l1
+  !if &and #l1 &xse @wl %ai-you-re
+    end-of-buffer
+    ; after a blank line, unless just below the "## You" line
+    backward-line
+    set-variable #l2 &not &or &xse @wl "[ \t]*" &xse @wl %ai-you-re
+    forward-line
+    !iif #l2  insert-string "\n"
+  !else
+    ai-chat-question
+  !endif
+  set-variable #l9 $window-line
+  ai-edit-append-at #l9 "*ai-quote*"
+  !force 0 delete-buffer "*ai-quote*"
+  end-of-buffer
+  insert-string "\n"
+  !if &not #l5
+    0x01 goto-position "\xa1"
+    ml-write "[AI: quoted in the chat]"
+  !endif
+!emacro
+
+; set #p9 to the | list of the opening fence lines of the code blocks of the current chat
+0 define-macro ai-chat-blocks
+  0xc0 set-position "\xaa"
+  set-variable #l1 "|"
+  set-variable #l2 ""
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" %ai-fence-regex
+    !iif &not $status  !break
+    !iif &not &len #l2  set-variable #l1 &spr "%s%d|" #l1 $window-line
+    ai-fence-line @wl #l2
+    set-variable #l2 %ai-fence
+    end-of-line
+  !done
+  0xc0 goto-position "\xaa"
+  set-variable #p9 #l1
+!emacro
+
+; move to the next (@1 1) or previous (@1 0) line of | list @2 from the current line, else say
+; there is none, which is called @3
+0 define-macro ai-chat-move
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l4 $window-line
+  set-variable #l5 0
+  set-variable #l6 0
+  !while &not &seq &set #l7 &lget #l2 &inc #l6 1 ""
+    !if #l1
+      !if &gre #l7 #l4
+        set-variable #l5 #l7
+        !break
+      !endif
+    !elif &les #l7 #l4
+      set-variable #l5 #l7
+    !endif
+  !done
+  !if &not #l5
+    ml-write &spr "[AI: no %s %s]" &con #l1 "next" "previous" #l3
+    !return
+  !endif
+  set-variable $window-line #l5
+  beginning-of-line
+!emacro
+
+define-macro ai-next-part
+  ai-chat-map
+  ai-chat-move 1 %ai-map-roles "part"
+!emacro
+
+define-macro ai-prev-part
+  ai-chat-map
+  ai-chat-move 0 %ai-map-roles "part"
+!emacro
+
+define-macro ai-next-block
+  ai-chat-blocks
+  ai-chat-move 1 #l9 "code block"
+!emacro
+
+define-macro ai-prev-block
+  ai-chat-blocks
+  ai-chat-move 0 #l9 "code block"
+!emacro
+
+; fold or unfold the part of the chat at the point, the chat is unfolded when it is sent or
+; changed by these commands
+define-macro ai-fold
+  !iif &not &exi collapse-current  !force execute-file "collapse"
+  ; on a folded part's line it is opened
+  !force 2 narrow-buffer
+  !iif $status  !return
+  !force search-buffer "bme" &spr "^%s$" %ai-role-re
+  !if &not $status
+    ml-write "[AI: not in a part of the chat]"
+    !abort
+  !endif
+  !if &and %ai-busy &seq $buffer-bname %ai-target
+    set-variable #l1 $window-line
+    goto-alpha-mark "\xa5"
+    set-variable #l2 $window-line
+    set-variable $window-line #l1
+    !if &not &gre #l1 #l2
+      ; not the reply being written, which would go into the fold
+    !else
+      ml-write "[AI: the reply is being written]"
+      !abort
+    !endif
+  !endif
+  forward-line
+  !force collapse-current
+!emacro
+
+; Tools: with %ai-tools 1 the model may ask to read a file of the project, search the files or
+; list them. Each request is shown and only run when the user allows it, its result is added to
+; the chat as a "## Tool" part and the chat is sent again
+
+; set #p9 to the directory the tools work in: an attached tree's, else the directory the
+; attachments' labels start from, else the current directory. The chat is the current buffer
+0 define-macro ai-tool-root
+  set-variable #l0 $buffer-bname
+  ai-att-scan
+  set-variable #l1 ""
+  find-buffer "*ai-att*"
+  beginning-of-buffer
+  !while &not &seq @wc ""
+    !iif &and &seq #l1 "" &seq &lget @wl 1 "tree"  set-variable #l1 &cat &lget @wl 2 "/"
+    forward-line
+  !done
+  beginning-of-buffer
+  !while &and &seq #l1 "" &not &seq @wc ""
+    !if &seq &lget @wl 1 "file"
+      set-variable #l2 &lget @wl 2
+      set-variable #l1 &lef #l2 &sub &len #l2 &len &lget @wl 6
+    !endif
+    forward-line
+  !done
+  !iif &seq #l1 ""  set-variable #l1 &stat "a" "./"
+  !iif &not &seq &rig #l1 &sub &len #l1 1 "/"  set-variable #l1 &cat #l1 "/"
+  !force 0 delete-buffer "*ai-att*"
+  find-buffer #l0
+  set-variable #p9 #l1
+!emacro
+
+; set #p9 to string argument @1 of the tool call in *ai-tool-args*, "" when not given
+0 define-macro ai-tool-arg
+  set-variable #l1 @1
+  set-variable #l0 $buffer-bname
+  set-variable #p9 ""
+  find-buffer "*ai-tool-args*"
+  beginning-of-buffer
+  !force search-buffer "me" &spr "\"%s\"[ \t\r\n]*:[ \t\r\n]*\\(\"\\|-?[0-9]+\\)" #l1
+  !if $status
+    !if &seq @s1 "\""
+      ai-temp-buffer "*ai-tool-val*"
+      find-buffer "*ai-tool-args*"
+      ai-json-string "*ai-tool-val*"
+      find-buffer "*ai-tool-val*"
+      beginning-of-buffer
+      set-variable #p9 @wl
+      !force 0 delete-buffer "*ai-tool-val*"
+    !else
+      set-variable #p9 @s1
+    !endif
+  !endif
+  find-buffer #l0
+!emacro
+
+; set #p9 to the absolute name of path @1 of the tool call, relative to directory @2
+0 define-macro ai-tool-path
+  set-variable #l1 @1
+  set-variable #l2 @2
+  !iif &seq #l1 ""  set-variable #l1 "."
+  !iif &not &sin &lef #l1 1 "/~"  set-variable #l1 &cat #l2 #l1
+  set-variable #l1 &stat "a" #l1
+  !iif &and &gre &len #l1 1 &seq &rig #l1 &sub &len #l1 1 "/"  set-variable #l1 &lef #l1 &sub &len #l1 1
+  set-variable #p9 #l1
+!emacro
+
+; escape @1 to be put in double quotes in a shell command
+0 define-macro ai-sh-quote
+  set-variable #l1 @1
+  set-variable #l1 &rep #l1 "\\" "\\\\"
+  set-variable #l1 &rep #l1 "\"" "\\\""
+  set-variable #l1 &rep #l1 "$" "\\$"
+  set-variable #l1 &rep #l1 "`" "\\`"
+  set-variable #p9 #l1
+!emacro
+
+; set #p8 to what tool call @1 (name) with the arguments in *ai-tool-args* asks for, from directory
+; @2, and #p7 to the absolute path it works on
+0 define-macro ai-tool-describe
+  set-variable #l1 @1
+  set-variable #l2 @2
+  ai-tool-arg "path"
+  set-variable #l3 #l9
+  ai-tool-path #l3 #l2
+  set-variable #p7 #l9
+  set-variable #l4 #l9
+  ai-home-name #l4
+  set-variable #l4 #l9
+  !if &seq #l1 "read_file"
+    ai-tool-arg "start_line"
+    set-variable #l5 #l9
+    ai-tool-arg "end_line"
+    set-variable #l6 #l9
+    !if &len #l5
+      set-variable #p8 &spr "read %s lines %s-%s" #l4 #l5 &con &len #l6 #l6 "on"
+    !else
+      set-variable #p8 &spr "read %s" #l4
+    !endif
+  !elif &seq #l1 "search_files"
+    ai-tool-arg "pattern"
+    set-variable #p8 &spr "search %s for %s" #l4 #l9
+  !elif &seq #l1 "list_files"
+    set-variable #p8 &spr "list the files in %s" #l4
+  !else
+    set-variable #p8 ""
+  !endif
+!emacro
+
+; run tool call @1 (name) with the arguments in *ai-tool-args* on path @2, from directory @3,
+; putting its result in *ai-tool-out*
+0 define-macro ai-tool-do
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l0 $buffer-bname
+  set-variable %ai-att-into "*ai-tool-out*"
+  ; named as the model would, from the project directory
+  !if &seq &lef #l2 &len #l3 #l3
+    set-variable #l4 &rig #l2 &len #l3
+    !iif &seq #l4 ""  set-variable #l4 "."
+  !else
+    ai-home-name #l2
+    set-variable #l4 #l9
+  !endif
+  !if &seq #l1 "read_file"
+    ai-tool-arg "start_line"
+    set-variable #l5 &con &len #l9 #l9 1
+    ai-tool-arg "end_line"
+    set-variable #l6 &con &len #l9 #l9 0
+    !iif &les #l5 1  set-variable #l5 1
+    !iif &or &not #l6 &gre #l6 &add #l5 499  set-variable #l6 &add #l5 499
+    !iif &les #l6 #l5  set-variable #l6 #l5
+    ai-att-read "file" #l2 #l5 #l6
+    find-buffer "*ai-tool-out*"
+    !if &len #l9
+      insert-string &spr "%s could not be read, %s.\n" #l4 #l9
+    !elif &gre #l5 #l8
+      insert-string &spr "%s has only %d lines.\n" #l4 #l8
+    !else
+      !iif &gre #l6 #l8  set-variable #l6 #l8
+      ai-att-fenced &spr "Lines %d-%d of the %d lines of %s:" #l5 #l6 #l8 #l4 #l7
+    !endif
+  !elif &seq #l1 "search_files"
+    ai-tool-arg "pattern"
+    ai-sh-quote #l9
+    set-variable #l5 #l9
+    ai-sh-quote #l2
+    set-variable #l6 #l9
+    ai-sh-quote #l3
+    set-variable #l7 &spr "cd \"%s\" && grep -rnIE --exclude-dir=.git -e \"%s\" -- \"%s\" | head -200" #l9 #l5 #l6
+    ai-temp-buffer "*ai-att-text*"
+    !force 0x42 pipe-shell-command #l7 "*ai-att-text*"
+    find-buffer "*ai-att-text*"
+    -1 buffer-mode "view"
+    end-of-buffer
+    set-variable #l8 &sub $window-line 1
+    find-buffer "*ai-tool-out*"
+    !if #l8
+      ai-att-fenced &spr "%d matching line%s, as file:line:text:" #l8 &con &equ #l8 1 "" "s" "text"
+    !else
+      insert-string "No lines match.\n"
+    !endif
+  !elif &seq #l1 "list_files"
+    ai-att-run "tree" #l2
+    find-buffer "*ai-tool-out*"
+    !if &len #l9
+      insert-string &spr "%s could not be listed, %s.\n" #l4 #l9
+    !else
+      ai-att-fenced &spr "The %d files under %s:" #l8 #l4 "text"
+    !endif
+  !else
+    find-buffer "*ai-tool-out*"
+    insert-string &spr "There is no tool %s.\n" #l1
+  !endif
+  !force 0 delete-buffer "*ai-att-text*"
+  set-variable %ai-att-into "*ai-req*"
+  find-buffer #l0
+!emacro
+
+; review the tool calls of the last reply of %ai-tool-chat, run as a callback once it is in
+0 define-macro ai-tool-review
+  !iif %ai-busy  !return
+  !iif &not &exi &spr ":%s:" %ai-tool-chat  !return
+  ; wait for a second without a key press, so keys being typed are not taken as answers
+  !if &not &seq $recent-keys %ai-edit-review-keys
+    set-variable %ai-edit-review-keys $recent-keys
+    1000 create-callback ai-tool-review
+    !return
+  !endif
+  0x01 set-position "\xa1"
+  !force 0 popup-window %ai-tool-chat
+  !iif &not $status  1 popup-window %ai-tool-chat
+  set-variable %ai-tool-msg ""
+  !force ai-tool-run-all
+  0x01 goto-position "\xa1"
+  !if &len %ai-tool-msg
+    1 screen-update
+    ml-write %ai-tool-msg
+  !endif
+!emacro
+
+; ask about and run the tool calls of the last reply in the current chat that have no result,
+; adding a "## Tool" part for each, then send the chat again unless the user stopped
+0 define-macro ai-tool-run-all
+  ai-chat-map
+  ; the last reply and the results after it
+  set-variable #l1 0
+  set-variable #l2 "|"
+  set-variable #l3 0
+  !while &not &seq &set #l4 &lget %ai-map-roles &inc #l3 1 ""
+    set-variable $window-line #l4
+    !if &xse @wl %ai-ai-re
+      set-variable #l1 #l4
+      set-variable #l2 "|"
+    !elif &xse @wl "## Tool[ \t]+\\([-_.:A-Za-z0-9]+\\).*"
+      set-variable #l2 &spr "%s%s|" #l2 @s1
+    !elif &xse @wl %ai-you-re
+      set-variable #l1 0
+    !endif
+  !done
+  !if &not #l1
+    set-variable %ai-tool-msg "[AI: no tool calls to answer]"
+    !return
+  !endif
+  ; its tool-call blocks
+  ai-temp-buffer "*ai-tool-calls*"
+  find-buffer %ai-tool-chat
+  set-variable $window-line #l1
+  set-variable #l5 ""
+  !repeat
+    !force forward-line
+    !iif &not $status  !break
+    !iif &seq @wc ""  !break
+    !iif &xse @wl %ai-role-re  !break
+    !if &len #l5
+      !if &xse @wl "[ \t]*\\(```\\|~~~\\).*"
+        ai-fence-line @wl #l5
+        set-variable #l5 %ai-fence
+      !endif
+    !elif &xse @wl "[ \t]*\\(```\\|~~~\\).*"
+      !if &xse @wl "[ \t]*\\(```+\\|~~~+\\)[ \t]*tool-call[ \t]+\\([-_.:A-Za-z0-9]+\\)[ \t]+\\([-_.:A-Za-z0-9]+\\)[ \t]*"
+        set-variable #l6 &spr "\t%s\t%s\t%d\t" @s2 @s3 $window-line
+        !if &not &lfind #l2 @s2
+          find-buffer "*ai-tool-calls*"
+          end-of-buffer
+          insert-string &cat #l6 "\n"
+          find-buffer %ai-tool-chat
+        !endif
+      !endif
+      ai-fence-line @wl ""
+      set-variable #l5 %ai-fence
+    !endif
+  !done
+  ai-tool-root
+  set-variable %ai-tool-dir #l9
+  set-variable %ai-tool-stop 0
+  set-variable %ai-tool-auto 0
+  set-variable #l3 0
+  !repeat
+    find-buffer "*ai-tool-calls*"
+    set-variable $window-line &add #l3 1
+    !iif &seq @wc ""  !break
+    set-variable #l4 @wl
+    set-variable #l3 &add #l3 1
+    find-buffer %ai-tool-chat
+    ; its arguments are the lines of its block
+    set-variable #l5 &lget #l4 3
+    set-variable $window-line #l5
+    ai-fence-line @wl ""
+    set-variable #l6 %ai-fence
+    !repeat
+      !force forward-line
+      !iif &or &not $status &seq @wc ""  !break
+      !if &xse @wl "[ \t]*\\(```\\|~~~\\).*"
+        ai-fence-line @wl #l6
+        !iif &not &len %ai-fence  !break
+      !endif
+    !done
+    set-variable #l9 $window-line
+    ai-edit-copy &add #l5 1 #l9 "*ai-tool-args*"
+    ai-temp-buffer "*ai-tool-out*"
+    find-buffer %ai-tool-chat
+    set-variable #l2 &lget #l4 2
+    ; sets #l7 to the path it works on and #l8 to what it does
+    ai-tool-describe #l2 %ai-tool-dir
+    !if %ai-tool-stop
+      set-variable #l9 "x"
+    !elif &not &len #l8
+      set-variable #l9 "u"
+    !elif %ai-tool-auto
+      set-variable #l9 "y"
+    !else
+      !force set-variable #l9 @mc1 &spr "AI asks to %s, allow it (y/n/a/q)? " #l8 "yYnNaAqQ"
+      !iif &not $status  set-variable #l9 "q"
+      set-variable #l9 &slo #l9
+    !endif
+    !if &seq #l9 "a"
+      set-variable %ai-tool-auto 1
+      set-variable #l9 "y"
+    !endif
+    !if &seq #l9 "y"
+      ai-tool-do #l2 #l7 %ai-tool-dir
+    !else
+      find-buffer "*ai-tool-out*"
+      !if &seq #l9 "u"
+        insert-string &spr "There is no tool %s.\n" #l2
+      !elif &seq #l9 "n"
+        insert-string "The user did not allow this.\n"
+      !else
+        insert-string "The user stopped the tool calls.\n"
+        set-variable %ai-tool-stop 1
+      !endif
+      find-buffer %ai-tool-chat
+    !endif
+    ; the result as a part of the chat
+    ai-chat-separate
+    insert-string &spr "## Tool %s\n\n" &lget #l4 1
+    ai-edit-append "*ai-tool-out*"
+    insert-string "\n"
+  !done
+  !force 0 delete-buffer "*ai-tool-calls*"
+  !force 0 delete-buffer "*ai-tool-args*"
+  !force 0 delete-buffer "*ai-tool-out*"
+  !if %ai-tool-stop
+    ai-chat-separate
+    insert-string "## You\n\n"
+    set-variable %ai-tool-msg "[AI: tool calls stopped, write the next question]"
+    !return
+  !endif
+  set-variable %ai-tool-round &add %ai-tool-round 1
+  !if &gre %ai-tool-round %ai-tool-rounds
+    ai-chat-separate
+    insert-string "## You\n\n"
+    set-variable %ai-tool-msg &spr "[AI: stopped after %d rounds of tool calls, C-c C-c goes on]" %ai-tool-rounds
+    !return
+  !endif
+  !force ai-start
+!emacro
+
+; insert the code block of the reply to ai-commit-message into the buffer it was asked from, run as
+; a callback once the reply is in
+0 define-macro ai-insert-review
+  !iif %ai-busy  !return
+  !iif &not &exi &spr ":%s:" %ai-insert-chat  !return
+  !if &not &seq $recent-keys %ai-edit-review-keys
+    set-variable %ai-edit-review-keys $recent-keys
+    1000 create-callback ai-insert-review
+    !return
+  !endif
+  set-variable #l0 $buffer-bname
+  find-buffer %ai-insert-chat
+  end-of-buffer
+  !force ai-insert-block "i"
+  !iif &not $status  find-buffer #l0
+  1 screen-update
+  ml-write "[AI: the message is in, edit it as needed]"
+!emacro
+
+; set #p9 to the directory of the git work tree of the current buffer's file, else the current
+; directory, with no / at its end
+0 define-macro ai-git-dir
+  set-variable #l1 $buffer-fname
+  !if &len #l1
+    set-variable #l1 &lef #l1 &sub &rsin "/" #l1 1
+    ; the message of a commit is edited in the .git directory
+    !iif &seq &rig #l1 &sub &len #l1 5 "/.git"  set-variable #l1 &lef #l1 &sub &len #l1 5
+  !else
+    set-variable #l1 &stat "a" "./"
+    !iif &seq &rig #l1 &sub &len #l1 1 "/"  set-variable #l1 &lef #l1 &sub &len #l1 1
+  !endif
+  set-variable #p9 #l1
+!emacro
+
+; write a commit message for the changes staged in git, from the diff of them, into the current
+; buffer at the point, such as the message buffer git opens
+define-macro ai-commit-message
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  ai-git-dir
+  set-variable #l1 #l9
+  !if &or &sin "\"" #l1 &or &sin "$" #l1 &sin "`" #l1
+    ml-write "[AI: the directory's name has a quote, $ or ` in it]"
+    !abort
+  !endif
+  set-variable %ai-key-out ""
+  !force 0x402 pipe-shell-command &spr "git -C \"%s\" diff --cached --quiet" #l1 "%ai-key-out"
+  set-variable #l2 $result
+  set-variable %ai-key-out ""
+  !if &equ #l2 0
+    ml-write &spr "[AI: nothing is staged in %s]" #l1
+    !abort
+  !elif &not &equ #l2 1
+    ml-write &spr "[AI: %s is not in a git work tree]" #l1
+    !abort
+  !endif
+  set-variable #l3 &spr "git -C \"%s\" --no-pager diff --cached --no-ext-diff --no-color" #l1
+  set-variable %ai-src $buffer-bname
+  set-variable %ai-src-region 0
+  0x01 set-position "\xa1"
+  ai-chat
+  ai-chat-question
+  ai-chat-attach "cmd" #l3 0 0
+  ai-cmd-allow #l3 $buffer-bname
+  ai-chat-text-point
+  insert-string &cat %ai-commit-prompt "\n"
+  set-variable %ai-insert-next 1
+  !force ai-start
+  !iif &not %ai-busy  set-variable %ai-insert-next 0
+  0x01 goto-position "\xa1"
+!emacro
+
+; ask for a fix of the error on the current line of a compile or grep buffer, sending the message
+; and the function of the file it is in. Once the reply is in its edits are reviewed
+define-macro ai-fix-error
+  !if %ai-busy
+    ml-write "[AI: busy, wait for the reply or use ai-cancel]"
+    !abort
+  !endif
+  set-variable #l1 $window-line
+  set-variable #l2 $window-col
+  !force backward-line
+  !force 6 get-next-line
+  set-variable #l3 &and $status &equ $window-line #l1
+  set-variable $window-line #l1
+  !if &not #l3
+    set-variable $window-col #l2
+    ml-write "[AI: no error message on this line]"
+    !abort
+  !endif
+  set-variable #l4 :next-file
+  set-variable #l5 :next-line
+  set-variable #l6 "file"
+  !if &and &seq &lef #l4 1 "*" &seq &rig #l4 &sub &len #l4 1 "*"
+    set-variable #l6 "buffer"
+    set-variable #l4 &mid #l4 1 &sub &len #l4 2
+  !endif
+  ; the message: this line and the indented lines after it
+  set-variable #l7 $window-line
+  !repeat
+    !force forward-line
+    !iif &or &not $status &seq @wc ""  !break
+    !iif &not &xse @wl "[ \t]+[^ \t\n].*"  !break
+    !iif &gre &sub $window-line #l7 9  !break
+  !done
+  set-variable #l8 $window-line
+  ai-edit-copy #l7 #l8 "*ai-quote*"
+  set-variable $window-line #l1
+  set-variable $window-col #l2
+  ; the function it is in, else the lines around it
+  set-variable #l0 $buffer-bname
+  ai-edit-buffer #l6 #l4
+  !if &seq #l9 ""
+    ml-write &spr "[AI: cannot find %s]" #l4
+    !abort
+  !endif
+  find-buffer #l9
+  0x0c0 set-position "\xab"
+  !force #l5 goto-line
+  ai-function-lines
+  !if &not #l9
+    set-variable #l1 &sub #l5 %ai-attach-lines
+    !iif &les #l1 1  set-variable #l1 1
+    set-variable #l2 &add #l5 %ai-attach-lines
+    end-of-buffer
+    !iif &gre #l2 &sub $window-aline 1  set-variable #l2 &sub $window-aline 1
+  !endif
+  0x0c0 goto-position "\xab"
+  find-buffer #l0
+  0x01 set-position "\xa1"
+  ai-chat
+  ai-chat-question
+  ai-chat-attach #l6 #l4 #l1 #l2
+  ai-chat-text-point
+  insert-string "```text\n"
+  ai-edit-append-at $window-line "*ai-quote*"
+  !force 0 delete-buffer "*ai-quote*"
+  end-of-buffer
+  insert-string &spr "```\n%s\n" %ai-fix-prompt
+  set-variable %ai-edit-review-next 1
+  !force ai-start
+  !iif &not %ai-busy  set-variable %ai-edit-review-next 0
+  0x01 goto-position "\xa1"
+!emacro
+
 define-macro ai-new
   !if %ai-busy
     ml-write "[AI: busy, wait for the reply or use ai-cancel]"
     !abort
   !endif
   ai-chat
-  beginning-of-buffer
-  !force search-buffer "me" "^## AI[ \t]*$"
-  !if $status
-    !iif &not &iseq @mc1 "Discard the current chat (y/n)? " "yYnN" "y"  !abort
+  !if %ai-chat-save
+    ; the chat is kept in its file
+    !force ai-chat-save
+  !else
+    beginning-of-buffer
+    !force search-buffer "me" &spr "^%s$" %ai-ai-re
+    !if $status
+      !iif &not &iseq @mc1 "Discard the current chat (y/n)? " "yYnN" "y"  !abort
+    !endif
   !endif
   ai-chat-init
+  !force unset-variable :ai-file
+  !force unset-variable :ai-tokens-in
+  !force unset-variable :ai-tokens-out
+  !force unset-variable :ai-cmd-ok
 !emacro
 
 define-macro ai-cancel
   !if &not %ai-busy
     ml-write "[AI: no request to cancel]"
+    !return
+  !endif
+  !if %ai-retry-at
+    ; waiting to try again
+    !force -1 create-callback ai-retry-send
+    set-variable %ai-cancel 1
+    ai-finish
     !return
   !endif
   set-variable #l0 $buffer-bname
@@ -3002,10 +6011,19 @@ define-macro ai-cancel
   find-buffer #l0
 !emacro
 
-; fill *ai-models* with the server's model ids, one per line, #p9 is the count
+; fill *ai-models* with the server's model ids that do not match %ai-model-skip, one per line and
+; sorted, #p9 is the count. The list is kept for the server unless @1 is 1
 0 define-macro ai-model-list
   set-variable #l0 $buffer-bname
   set-variable #p9 0
+  !if &and &not @1 &and &seq %ai-models-url %ai-base-url &exi ":*ai-models*:"
+    find-buffer "*ai-models*"
+    end-of-buffer
+    set-variable #p9 &sub $window-line 1
+    find-buffer #l0
+    !return
+  !endif
+  set-variable %ai-models-url ""
   ai-get-key
   set-variable #l1 &exi %http-header
   !iif #l1  set-variable #l2 %http-header
@@ -3034,18 +6052,39 @@ define-macro ai-cancel
     ai-json-string "*ai-models*"
     find-buffer "*ai-models*"
     goto-alpha-mark "\xa4"
-    insert-string "\n"
+    ; one that is not for chat is left out
+    beginning-of-line
+    !if &and &len %ai-model-skip &xse @wl &spr ".*\\(%s\\).*" %ai-model-skip
+      set-mark
+      end-of-line
+      -1 kill-region
+    !else
+      end-of-line
+      insert-string "\n"
+      set-variable #p9 &add #p9 1
+    !endif
     set-alpha-mark "\xa4"
     find-buffer "*ai-response*"
-    set-variable #p9 &add #p9 1
   !done
+  find-buffer "*ai-models*"
+  !if &gre #p9 1
+    beginning-of-buffer
+    set-mark
+    end-of-buffer
+    !force sort-lines
+    ; the empty line after the last is sorted first
+    beginning-of-buffer
+    !iif &seq @wc "\n"  forward-delete-char
+  !endif
   find-buffer #l0
+  !iif #p9  set-variable %ai-models-url %ai-base-url
 !emacro
 
+; choose the model, from the server's list when it gives one. An argument fetches the list again
 define-macro ai-set-model
   !force set-variable #l1 @1
   !if &not $status
-    ai-model-list
+    ai-model-list @?
     !if #l9
       set-variable #l1 @ml1a "AI model" %ai-model "*ai-models*"
     !else
@@ -3054,11 +6093,7 @@ define-macro ai-set-model
   !endif
   !iif &seq #l1 ""  !abort
   set-variable %ai-model #l1
-  !if &not &seq #l1 &reg "/history/ai-chat/model" ""
-    set-registry "/history/ai-chat/model" #l1
-    ; set-registry does not flag the history as changed, so it would not be saved
-    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
-  !endif
+  ai-profile-keep "model" #l1
   ml-write &spr "[AI: using model %s]" #l1
 !emacro
 
@@ -3072,9 +6107,13 @@ define-macro ai-set-effort
   !endif
   set-variable #l1 &trb #l1
   set-variable %ai-effort #l1
-  !if &not &seq #l1 &reg "/history/ai-chat/effort" ""
-    set-registry "/history/ai-chat/effort" #l1
-    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
-  !endif
+  ai-profile-keep "effort" #l1
   ml-write &con &len #l1 &spr "[AI: using %s effort]" #l1 "[AI: effort left to the model]"
 !emacro
+
+; the profile last chosen, once its macros are defined
+!if &not &exi %ai-profile
+  set-variable %ai-profile &reg "/history/ai-chat/profile" "default"
+  !iif &not &lfind %ai-profiles %ai-profile  set-variable %ai-profile "default"
+  !iif &not &seq %ai-profile "default"  !force ai-profile-apply
+!endif
