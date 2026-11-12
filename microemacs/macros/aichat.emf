@@ -303,6 +303,8 @@ define-macro ai-chat-keys
   !force goto-alpha-mark "\xac"
   set-mark
   beginning-of-buffer
+  ; the mark is only for going back, not a region to show
+  -1 show-region
   ml-write "[AI: the keys are listed at the top of the chat, C-x C-x goes back]"
 !emacro
 
