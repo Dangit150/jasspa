@@ -96,7 +96,12 @@ Ollama, LM Studio or llama.cpp.
 .PP
 The conversation is the text of the \fC*ai-chat*\fR buffer. Each part starts
 with a line holding just \fC## You\fR, \fC## AI\fR or \fC## System\fR, anything
-before the first of these is ignored. The whole chat is sent with every
+before the first of these is ignored. Such a line inside a fenced code block, one
+fenced by three or more backticks or tildes and ended by a line of at least as
+many of the same, is part of the block's text. A code block that a question or a
+reply leaves open is closed before the next part is added, and
+.B ai-send
+will not send a chat in which an open block hides the parts after it. The whole chat is sent with every
 question, so earlier questions and answers may be edited or deleted to change
 what the model sees, and the buffer may be saved to a file and the chat carried
 on later from any buffer holding these lines. A \fC## System\fR part replaces the
@@ -122,7 +127,7 @@ as the shortest end of its path that tells it apart from the other attached
 files, e.g. \fCsrc/exec.c\fR. A file that cannot be read, such as a directory
 or a binary file, or a range past its end, is noted in the request and in the
 message line, and a range that runs past the end is cut short. Deleting the
-line removes the attachment.
+line removes the attachment, and one inside a fenced code block is just text.
 .PP
 .B ai-chat
 shows the \fC*ai-chat*\fR buffer in a popup window and moves to its end, ready
@@ -242,23 +247,31 @@ are looked for in the file, exactly, then ignoring white space at the ends of
 lines, then ignoring indentation, in which case the replacement takes on the
 file's indentation: tabs for spaces or spaces for tabs a level at a time when
 the model used the other, else moved by as many columns as the model's lines
-were out. The \fCSEARCH\fR text must be found once, or once within the
-attached lines of the file. A file is named as in its attachment, by the end of
-its path, which must fit only one attached file, or by a path from where the
-attachments' names start; quotes, a leading \fC./\fR and line numbers after
-the name are ignored. A block the model left open is closed before the next
-block or the end of the reply. Each change is made and shown selected in
+were out. The \fCSEARCH\fR text, even one of blank lines only, must be found
+once, or once within the attached lines of the file. A file is named as in its
+attachment, by the end of its path, which must fit only one attached file, or by
+a path from where the attachments' names start; quotes, a leading \fC./\fR and
+line numbers after the name are ignored. A block the model left open is closed
+before the next block or the end of the reply, and an edit block shown inside
+another code block is not applied. Each change is made and shown selected in
 another window, and the user is asked whether to keep it: \fCy\fR keeps it,
 \fCn\fR puts the old lines back, \fCa\fR keeps it and the rest without
-asking and \fCq\fR, or \fCC-g\fR, puts it back and stops. The question warns
-when the printf style \fC%\fR formats of the lines have changed, as a reworded
-message may then no longer match the arguments of its call. With an argument of
+asking and \fCq\fR, or \fCC-g\fR, puts it back and stops. With an argument of
 \fC0\fR every change is kept without asking.
+.PP
+The question warns when the printf style \fC%\fR formats of the lines look
+changed, as a reworded message may then no longer match the arguments of its
+call, and such a change is asked about even when the changes are being kept
+without asking. The check is a guide only: it compares the arguments the formats
+take, their types, sizes and \fC*\fR widths, ignoring flags, widths and
+precisions, and knows nothing of other kinds of format.
 .PP
 Changing a file that is not attached is only done once the user agrees, and an
 empty \fCSEARCH\fR creates the file, if it does not exist, in a new buffer, or
-fills an empty file or buffer. A buffer in view mode is not changed. Nothing is
-saved. As each change is made, kept or not, a line is added after
+fills an empty file or buffer. The user is asked once for each such file in a
+run, even when the changes are being kept without asking, which only lets an
+attached file be created without asking. A buffer in view mode is not changed.
+Nothing is saved. As each change is made, kept or not, a line is added after
 its block giving what happened to it, such as
 .CS
 (edit 1 applied, exec.c line 2163)
@@ -270,12 +283,15 @@ moved to match.
 .PP
 .B ai-undo-edits
 puts back the lines changed by the last
-.BR ai-apply-edits ,
-and marks each change it undoes as \fCundone\fR. A change whose lines have
-been moved by lines added or removed above them is found again, but one whose
-lines have been edited since is left, as is a change that only removed lines
-once lines have been added or removed anywhere in the file. A file created by an
-edit is left in its buffer.
+.B ai-apply-edits
+that kept a change, and marks each change it undoes as \fCundone\fR. A change
+whose lines have been moved by lines added or removed above them is found again,
+but one whose lines have been edited since is left. A change that only removed
+lines is put back between the lines that were either side of it, so it is left
+when those lines, up to three each side, have been edited or no longer fit one
+place. A
+file created by an edit has its buffer deleted, unless it has been changed or
+saved since. A change in a buffer now in view mode is left.
 .PP
 .B ai-edit
 asks for one change to code, such as rewording an error message. Run from a

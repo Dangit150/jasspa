@@ -33,13 +33,14 @@
 !iif &not &exi %ai-edit-actions   set-variable %ai-edit-actions "|message|"
 !iif &not &exi %ai-edit-action-message  set-variable %ai-edit-action-message "Rewrite the message quoted above, which comes from the attached code, as follows: %s. It may be a format string, so keep its % formats matching the arguments, and change every place it is used."
 !iif &not &exi %ai-edit-prompt    set-variable %ai-edit-prompt "To change an attached file reply with edit blocks rather than the whole file. An edit block is a fenced block whose info string is edit followed by the file's name from its attachment, holding one or more changes:\n```edit src/main.c\n<<<<<<< SEARCH\nlines copied exactly from the file\n=======\nthe lines that replace them\n>>>>>>> REPLACE\n```\nCopy the SEARCH lines exactly, indentation included, using just enough lines to match one place in the file. Give each place that changes its own SEARCH and REPLACE, in the order they come in the file. An empty SEARCH creates a new file. Explain the changes briefly outside the blocks."
-set-variable %ai-role-regex "^## \\(You\\|AI\\|System\\)[ \t]*$"
-; an attachment line, the search form and the whole line form for &xse
-set-variable %ai-att-regex "^@\\(file\\|buffer\\)[ \t]+\\(.*[^ \t\n]\\)[ \t]*$"
+; an attachment line, for &xse
 set-variable %ai-att-line "@\\(file\\|buffer\\)[ \t]+\\(.*[^ \t\n]\\)[ \t]*"
 ; an edit block's opening fence and, for &xse, the status line written after it for each change
 set-variable %ai-edit-fence "^[ \t]*\\(```+\\)[ \t]*edit[ \t]+\\(.*[^ \t\n]\\)[ \t]*$"
 set-variable %ai-edit-status "(edit [0-9]+ [a-z]+.*"
+; a role line, a code fence or an attachment line, the lines that give a chat its structure
+set-variable %ai-map-regex "^\\(## \\(You\\|AI\\|System\\)[ \t]*\\|[ \t]*\\(```\\|~~~\\).*\\|@\\(file\\|buffer\\)[ \t]+.*[^ \t\n][ \t]*\\)$"
+set-variable %ai-fence-regex "^[ \t]*\\(```\\|~~~\\)"
 set-variable %ai-busy 0
 set-variable %ai-spaces "                                                                "
 set-variable %ai-src ""
@@ -48,6 +49,7 @@ set-variable %ai-req-file ""
 set-variable %ai-hdr-file ""
 set-variable %ai-req-note ""
 set-variable %ai-edit-review-next 0
+set-variable %ai-undo-new 0
 
 0 define-macro ai-get-key
   set-variable #p9 %ai-api-key
@@ -122,12 +124,94 @@ set-variable %ai-edit-review-next 0
   !endif
 !emacro
 
+; set %ai-fence to the code fence open after the line of text @1 when fence @2 is open before it,
+; "" for none. A fence is 3 or more backticks or tildes, closed by a line of at least as many of
+; the same character
+0 define-macro ai-fence-line
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable %ai-fence #l2
+  !if &not &len #l2
+    !if &xse #l1 "[ \t]*\\(```+\\)[^`]*"
+      set-variable %ai-fence @s1
+    !elif &xse #l1 "[ \t]*\\(~~~+\\).*"
+      set-variable %ai-fence @s1
+    !endif
+  !elif &xse #l1 "[ \t]*\\(```+\\|~~~+\\)[ \t]*"
+    !iif &and &seq &lef @s1 1 &lef #l2 1 &not &les &len @s1 &len #l2  set-variable %ai-fence ""
+  !endif
+!emacro
+
+; map the current chat: the role lines and the attachment lines of its "## You" sections that are
+; not in fenced code, as | lists of line numbers in %ai-map-roles and %ai-map-atts.
+; %ai-map-last is the last role line, %ai-map-open the line of a code block left open at the end
+; and %ai-map-fence its fence, 0 and "" when there is none. The point is not moved
+0 define-macro ai-chat-map
+  0xc0 set-position "\xa9"
+  set-variable #l1 "|"
+  set-variable #l2 "|"
+  set-variable #l3 ""
+  set-variable #l4 ""
+  set-variable #l5 0
+  set-variable #l7 0
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" %ai-map-regex
+    !iif &not $status  !break
+    set-variable #l6 @wl
+    !if &len #l3
+      !if &xse #l6 "[ \t]*\\(```\\|~~~\\).*"
+        ai-fence-line #l6 #l3
+        set-variable #l3 %ai-fence
+      !endif
+    !elif &xse #l6 "## \\(You\\|AI\\|System\\)[ \t]*"
+      set-variable #l4 @s1
+      set-variable #l7 $window-line
+      set-variable #l1 &spr "%s%d|" #l1 #l7
+    !elif &xse #l6 %ai-att-line
+      !iif &seq #l4 "You"  set-variable #l2 &spr "%s%d|" #l2 $window-line
+    !else
+      ai-fence-line #l6 ""
+      set-variable #l3 %ai-fence
+      set-variable #l5 $window-line
+    !endif
+    end-of-line
+  !done
+  0xc0 goto-position "\xa9"
+  set-variable %ai-map-roles #l1
+  set-variable %ai-map-atts #l2
+  set-variable %ai-map-last #l7
+  set-variable %ai-map-open &con &len #l3 #l5 0
+  set-variable %ai-map-fence #l3
+!emacro
+
+; close the code block left open at the end of the current chat, as mapped by ai-chat-map, so a
+; role line added after it is not taken as its text
+0 define-macro ai-chat-close-fence
+  !if %ai-map-open
+    end-of-buffer
+    !iif &gre $window-col 0  insert-string "\n"
+    ; after its last line of text
+    !repeat
+      backward-line
+    !until &or &not &gre $window-line %ai-map-open &not &xse @wl "[ \t]*"
+    forward-line
+    beginning-of-line
+    insert-string &cat %ai-map-fence "\n"
+    set-variable %ai-map-open 0
+  !endif
+!emacro
+
 ; leave the point where the text of a new question goes, reusing a last "## You" that holds
 ; nothing but attachments
 0 define-macro ai-chat-question
-  end-of-buffer
-  !force search-buffer "meb" %ai-role-regex
-  !if &and $status &seq @s1 "You"
+  ai-chat-map
+  set-variable #l1 %ai-map-last
+  !if #l1
+    set-variable $window-line #l1
+    set-variable #l1 &xse @wl "## You[ \t]*"
+  !endif
+  !if #l1
     set-variable #l1 $window-line
     set-variable #l2 0
     !repeat
@@ -153,6 +237,7 @@ set-variable %ai-edit-review-next 0
       !endif
     !done
   !endif
+  ai-chat-close-fence
   ai-chat-separate
   insert-string "## You\n"
 !emacro
@@ -161,11 +246,16 @@ set-variable %ai-edit-review-next 0
 ; line and attachments, starting a question when there is none. #p8 is the line after the
 ; "## You" line
 0 define-macro ai-chat-attach-point
-  end-of-buffer
-  !force search-buffer "meb" %ai-role-regex
-  !if &and $status &seq @s1 "You"
+  ai-chat-map
+  set-variable #l1 %ai-map-last
+  !if #l1
+    set-variable $window-line #l1
+    set-variable #l1 &xse @wl "## You[ \t]*"
+  !endif
+  !if #l1
     forward-line
   !else
+    ai-chat-close-fence
     ai-chat-separate
     insert-string "## You\n\n"
     backward-line
@@ -343,15 +433,13 @@ define-macro ai-chat
   set-variable #l0 $buffer-bname
   ai-temp-buffer "*ai-att*"
   find-buffer #l0
-  beginning-of-buffer
-  !repeat
-    !force search-buffer "me" %ai-att-regex
-    !iif &not $status  !break
-    set-variable #l4 @s1
-    set-variable #l5 @s2
-    set-variable #l6 $window-line
-    !force search-buffer "meb" %ai-role-regex
-    !if &and $status &seq @s1 "You"
+  ai-chat-map
+  set-variable #l8 0
+  !while &not &seq &set #l6 &lget %ai-map-atts &inc #l8 1 ""
+    set-variable $window-line #l6
+    !if &xse @wl %ai-att-line
+      set-variable #l4 @s1
+      set-variable #l5 @s2
       ai-att-parse #l4 #l5
       set-variable #l7 &spr "\t%s\t%s\t%d\t%d\t" #l4 #l1 #l2 #l3
       find-buffer "*ai-att*"
@@ -366,8 +454,6 @@ define-macro ai-chat
       !endif
       find-buffer #l0
     !endif
-    set-variable $window-line #l6
-    end-of-line
   !done
   ; a file is named by the shortest end of its name that no other file ends with
   find-buffer "*ai-att*"
@@ -569,31 +655,33 @@ define-macro ai-chat
   set-variable %ai-req-atts &add %ai-req-atts 1
 !emacro
 
-; expand the attachment lines in the text of the "## You" section just added to *ai-req*,
-; which is chat line @1 onwards, inserted text is behind the point so is not searched
+; expand the attachment lines, as mapped by ai-chat-map, in the text of the "## You" section just
+; added to *ai-req*, which is chat lines @1 to @2 (exclusive)
 0 define-macro ai-att-expand
   set-variable #l5 @1
   set-variable $window-line %ai-req-line
   set-variable $window-col %ai-req-col
-  ; put the text on its own lines so an attachment on its first line is found
+  ; put the text on its own lines so an attachment on its first line is expanded
   insert-string "\n"
-  set-variable #l4 $window-line
-  set-variable #l6 0
-  !repeat
-    !force search-buffer "me" %ai-att-regex
-    !iif &not $status  !break
-    set-variable #l7 @s1
-    set-variable #l8 @s2
-    set-variable #l9 &sub &add #l5 &sub $window-line #l4 #l6
-    beginning-of-line
-    set-mark
-    end-of-line
-    -1 kill-region
-    set-variable #l0 $window-line
-    ai-att-parse #l7 #l8
-    ai-att-insert #l7 #l1 #l2 #l3 #l9
-    set-variable #l6 &add #l6 &sub $window-line #l0
-    end-of-line
+  ; the line in *ai-req* of a chat line, less the chat line
+  set-variable #l4 &sub $window-line #l5
+  set-variable #l0 0
+  !while &not &seq &set #l9 &lget %ai-map-atts &inc #l0 1 ""
+    !if &and &not &les #l9 #l5 &les #l9 @2
+      set-variable $window-line &add #l9 #l4
+      !if &xse @wl %ai-att-line
+        set-variable #l7 @s1
+        set-variable #l8 @s2
+        beginning-of-line
+        set-mark
+        end-of-line
+        -1 kill-region
+        set-variable #l6 $window-line
+        ai-att-parse #l7 #l8
+        ai-att-insert #l7 #l1 #l2 #l3 #l9
+        set-variable #l4 &add #l4 &sub $window-line #l6
+      !endif
+    !endif
   !done
   set-variable $window-line %ai-req-line
   end-of-line
@@ -612,8 +700,15 @@ define-macro ai-chat
   set-variable %ai-req-col $window-col
 !emacro
 
-; escape the text, which ends at the point, and join its lines, flag 16 writes a line without its newline
+; end the message started by ai-req-open
 0 define-macro ai-req-close
+  ai-req-escape
+  insert-string "\"}"
+!emacro
+
+; escape the text from %ai-req-line & %ai-req-col to the point for a JSON string and join its lines,
+; flag 16 writes a line without its newline. The point is left at its end
+0 define-macro ai-req-escape
   set-variable #l1 $window-line
   set-variable $window-line %ai-req-line
   set-variable $window-col %ai-req-col
@@ -643,7 +738,6 @@ define-macro ai-chat
     forward-line
   !done
   end-of-line
-  insert-string "\"}"
 !emacro
 
 ; copy the trimmed lines @3 to @4 (exclusive) of chat buffer @1 as a message for role @2
@@ -673,7 +767,7 @@ define-macro ai-chat
   !force yank
   -1 yank
   set-variable $system #l3
-  !iif &seq @2 "You"  ai-att-expand #l1
+  !iif &seq @2 "You"  ai-att-expand #l1 #l2
   !iif &and &seq @2 "System" %ai-req-natt  insert-string &cat "\n\n" %ai-edit-prompt
   ai-req-close
   set-variable #p7 ","
@@ -685,16 +779,26 @@ define-macro ai-chat
   set-variable %ai-req-atts 0
   set-variable %ai-req-bad 0
   set-variable %ai-req-warn ""
+  ; the chat is mapped by the scan, the sections are between its role lines
   ai-att-scan
+  set-variable %ai-req-natt #l9
   ai-temp-buffer "*ai-req*"
-  insert-string &spr "{\"model\":\"%s\",\"stream\":%s,\"messages\":[" %ai-model &con @1 "true" "false"
+  insert-string "{\"model\":\""
+  set-variable %ai-req-line $window-line
+  set-variable %ai-req-col $window-col
+  insert-string %ai-model
+  ai-req-escape
+  insert-string &spr "\",\"stream\":%s,\"messages\":[" &con @1 "true" "false"
   set-variable #l7 ""
   find-buffer #l0
-  beginning-of-buffer
+  set-variable #l4 0
+  set-variable #l5 0
+  !while &not &seq &set #l2 &lget %ai-map-roles &inc #l5 1 ""
+    set-variable $window-line #l2
+    !iif &xse @wl "## System[ \t]*"  set-variable #l4 1
+  !done
   ; with attachments the model is told how to reply with edits, a "## System" part included
-  set-variable %ai-req-natt #l9
-  !force search-buffer "me" "^## System[ \t]*$"
-  !if &not $status
+  !if &not #l4
     !if &or &len %ai-system-prompt #l9
       find-buffer "*ai-req*"
       ai-req-open "system" ""
@@ -705,26 +809,14 @@ define-macro ai-chat
       find-buffer #l0
     !endif
   !endif
-  beginning-of-buffer
-  !force search-buffer "me" %ai-role-regex
-  !while $status
+  set-variable #l5 0
+  !while &not &seq &set #l2 &lget %ai-map-roles &inc #l5 1 ""
+    set-variable $window-line #l2
+    !iif &not &xse @wl "## \\(You\\|AI\\|System\\)[ \t]*"  !abort
     set-variable #l1 @s1
-    forward-line
-    beginning-of-line
-    set-variable #l2 $window-line
-    !force search-buffer "me" %ai-role-regex
-    !if $status
-      beginning-of-line
-      set-variable #l3 $window-line
-      set-variable #l4 1
-    !else
-      set-variable #l3 &add $window-eline 1
-      set-variable #l4 0
-    !endif
-    ai-req-section #l0 #l1 #l2 #l3 #l7
-    !iif &not #l4  !break
-    set-variable $window-line #l3
-    search-buffer "me" %ai-role-regex
+    set-variable #l3 &lget %ai-map-roles &add #l5 1
+    !iif &seq #l3 ""  set-variable #l3 &add $window-eline 1
+    ai-req-section #l0 #l1 &add #l2 1 #l3 #l7
   !done
   find-buffer "*ai-req*"
   end-of-buffer
@@ -911,12 +1003,13 @@ define-macro ai-chat
   goto-alpha-mark "\xa4"
   set-variable #l8 $window-line
   goto-alpha-mark "\xa5"
-  set-variable #l7 0
+  set-variable #l7 ""
   !while &not &gre $window-line #l8
     beginning-of-line
-    !if &xse @wl "[ \t]*```.*"
-      set-variable #l7 &not #l7
-    !elif &not #l7
+    !if &xse @wl "[ \t]*\\(```\\|~~~\\).*"
+      ai-fence-line @wl #l7
+      set-variable #l7 %ai-fence
+    !elif &not &len #l7
       !iif &not &xse @wl "\\(    \\|\t\\|[ \t]*[|#]\\).*"  ai-wrap-line
     !endif
     forward-line
@@ -944,6 +1037,9 @@ define-macro ai-chat
       !endif
     !endif
   !endif
+  ; a reply cut short in a code block would hide the next role line
+  ai-chat-map
+  ai-chat-close-fence
   ai-chat-separate
   insert-string "## You\n\n"
   find-buffer #l0
@@ -1105,6 +1201,8 @@ define-macro ai-chat
     !endif
   !endif
   !iif &len %ai-req-warn  set-variable %ai-req-note &spr "%s, %s" %ai-req-note %ai-req-warn
+  ; a code block the question leaves open would hide the reply's role line, the request mapped it
+  ai-chat-close-fence
   ai-chat-separate
   insert-string "## AI\n\n"
   set-alpha-mark "\xa4"
@@ -1131,12 +1229,20 @@ define-macro ai-send
     ml-write "[AI: busy, wait for the reply or use ai-cancel]"
     !abort
   !endif
-  end-of-buffer
-  !force search-buffer "meb" %ai-role-regex
-  !if &not $status
+  ai-chat-map
+  set-variable #l1 %ai-map-last
+  !if #l1
+    set-variable $window-line #l1
+    set-variable #l1 &xse @wl "## You[ \t]*"
+  !endif
+  !if &and &not #l1 %ai-map-open
+    ; the role lines after a code block left open are its text
+    ml-write &spr "[AI Error: the code block on line %d is not closed]" %ai-map-open
+    !abort
+  !elif &not %ai-map-last
     ml-write "[AI Error: no \"## You\" section to send]"
     !abort
-  !elif &not &seq @s1 "You"
+  !elif &not #l1
     ml-write "[AI Error: the last section is not a \"## You\" question]"
     !abort
   !endif
@@ -1454,21 +1560,23 @@ define-macro ai-code-action
 0 define-macro ai-find-block
   set-variable #l0 $window-line
   set-variable #l1 0
+  set-variable #l2 ""
   set-variable #p1 0
   set-variable #p2 0
   beginning-of-buffer
   !repeat
-    !force search-buffer "me" "^[ \t]*```"
+    !force search-buffer "me" %ai-fence-regex
     !iif &not $status  !break
-    !if #l1
-      !if &not &gre #l1 #l0
-        set-variable #p1 &add #l1 1
-        set-variable #p2 $window-line
-      !endif
-      set-variable #l1 0
-    !else
+    !iif &and &not &len #l2 &gre $window-line #l0  !break
+    ai-fence-line @wl #l2
+    !if &not &len #l2
       set-variable #l1 $window-line
+    !elif &not &len %ai-fence
+      set-variable #p1 &add #l1 1
+      set-variable #p2 $window-line
     !endif
+    set-variable #l2 %ai-fence
+    end-of-line
   !done
   set-variable $window-line #l0
 !emacro
@@ -1548,19 +1656,21 @@ define-macro ai-insert-block
 ; set #p1 & #p2 to the "## AI" line and the end line (exclusive) of the reply at or before the
 ; point of the current chat, #p1 is 0 when there is none
 0 define-macro ai-edit-reply
-  set-variable #p1 0
-  end-of-line
-  !force search-buffer "meb" %ai-role-regex
-  !if &and $status &not &seq @s1 "AI"
-    !force search-buffer "meb" "^## AI[ \t]*$"
-  !endif
-  !iif &not $status  !return
-  set-variable #l1 $window-line
-  end-of-line
-  !force search-buffer "me" %ai-role-regex
-  !if $status
-    set-variable #l2 $window-line
-  !else
+  set-variable #l0 $window-line
+  set-variable #l1 0
+  set-variable #l2 0
+  ai-chat-map
+  set-variable #l3 0
+  !while &not &seq &set #l4 &lget %ai-map-roles &inc #l3 1 ""
+    set-variable $window-line #l4
+    !if &and &not &gre #l4 #l0 &xse @wl "## AI[ \t]*"
+      set-variable #l1 #l4
+      set-variable #l2 0
+    !elif &and #l1 &not #l2
+      set-variable #l2 #l4
+    !endif
+  !done
+  !if &and #l1 &not #l2
     end-of-buffer
     set-variable #l2 $window-line
   !endif
@@ -1633,15 +1743,33 @@ define-macro ai-insert-block
   set-variable #p8 0
   set-variable $window-line #l1
   !repeat
-    !force search-buffer "me" %ai-edit-fence
+    !force search-buffer "me" %ai-fence-regex
     !iif &or &not $status &not &les $window-line #l2  !break
+    !if &not &xse @wl "[ \t]*\\(```+\\)[ \t]*edit[ \t]+\\(.*[^ \t\n]\\)[ \t]*"
+      ; another code block is passed over, an edit block in it is only shown
+      ai-fence-line @wl ""
+      set-variable #l3 %ai-fence
+      !while &len #l3
+        end-of-line
+        !force search-buffer "me" %ai-fence-regex
+        !if &or &not $status &not &les $window-line #l2
+          set-variable $window-line #l2
+          set-variable #l3 ""
+        !else
+          ai-fence-line @wl #l3
+          set-variable #l3 %ai-fence
+        !endif
+      !done
+      end-of-line
+      !continue
+    !endif
     set-variable #l3 @s1
     set-variable #l4 @s2
     set-variable #l5 $window-line
     set-variable #p8 &add #p8 1
     set-variable #l6 #l2
     set-variable #l8 1
-    !force search-buffer "me" &spr "^[ \t]*%s[ \t]*$" #l3
+    !force search-buffer "me" &spr "^[ \t]*%s`*[ \t]*$" #l3
     !if &and $status &les $window-line #l2
       set-variable #l6 $window-line
       set-variable #l8 0
@@ -1801,6 +1929,20 @@ define-macro ai-insert-block
     !endif
     set-variable #l3 &stat "a" &cat #l3 #l1
     set-variable #l4 "|"
+    ; it may be an attached file named another way, such as with ..
+    beginning-of-buffer
+    !while &not &seq @wc ""
+      set-variable #l7 @wl
+      !if &and &seq &lget #l7 1 "file" &seq &lget #l7 2 #l3
+        set-variable #l9 1
+        !if &lget #l7 3
+          set-variable #l4 &spr "%s%s-%s|" #l4 &lget #l7 3 &lget #l7 4
+        !else
+          set-variable #l5 1
+        !endif
+      !endif
+      forward-line
+    !done
   !endif
   !iif #l5  set-variable #l4 "|"
   find-buffer #l0
@@ -1857,7 +1999,7 @@ define-macro ai-insert-block
 
 ; set #p9 to a | list of the first lines of the places in buffer @1 where the @4 lines of
 ; *ai-edit-s* match, compared by @5 (see ai-edit-same). The places are found from SEARCH line
-; @3 + 1, whose text without indentation is @2
+; @3 + 1, whose text without indentation is @2, a blank line when ""
 0 define-macro ai-edit-find
   set-variable #l0 $buffer-bname
   set-variable #l1 @1
@@ -1872,7 +2014,11 @@ define-macro ai-insert-block
   set-variable #l8 &sub $window-line 1
   beginning-of-buffer
   !repeat
-    !force search-buffer "Me" #l2
+    !if &len #l2
+      !force search-buffer "Me" #l2
+    !else
+      !force search-buffer "me" "^[ \t]*$"
+    !endif
     !iif &not $status  !break
     set-variable #l7 $window-line
     set-variable #l6 &sub #l7 #l3
@@ -1899,7 +2045,10 @@ define-macro ai-insert-block
       set-variable #l8 &sub $window-line 1
     !endif
     set-variable $window-line #l7
-    end-of-line
+    ; an empty line's end is its start, which a blank line search would find again
+    !force forward-line
+    !iif &not $status  !break
+    beginning-of-line
   !done
   0xc0 goto-position "\xa6"
   find-buffer #l0
@@ -1947,7 +2096,6 @@ define-macro ai-insert-block
   find-buffer #l0
   set-variable #p1 0
   set-variable #p2 0
-  !iif &seq #l4 ""  !return
   set-variable #l6 0
   !repeat
     set-variable #l6 &add #l6 1
@@ -2078,7 +2226,9 @@ define-macro ai-insert-block
   find-buffer #l0
 !emacro
 
-; set #p9 to the printf style % formats in buffer @1, in order
+; set #p9 to the arguments the printf style % formats in buffer @1 take, in order: each format's
+; * widths, size and type, the flags, widths and precisions are dropped and types taking the same
+; argument are merged. A heuristic, it does not know a language's other formats
 0 define-macro ai-edit-formats
   set-variable #l0 $buffer-bname
   set-variable #l1 @1
@@ -2088,7 +2238,10 @@ define-macro ai-insert-block
   !repeat
     !force search-buffer "me" "\\(%%\\|%[-+ #0-9.*]*[hlLqjzt]*[diouxXeEfFgGaAcspn]\\)"
     !iif &not $status  !break
-    !iif &not &seq @s1 "%%"  set-variable #l9 &cat #l9 @s1
+    !if &not &seq @s1 "%%"
+      set-variable #l2 &xrep @s1 "[-+ #0-9.]" ""
+      set-variable #l9 &cat #l9 &xrep &xrep &xrep #l2 "i$" "d" "[ouxX]$" "u" "[eEfFgGaA]$" "f"
+    !endif
   !done
   find-buffer #l0
   set-variable #p9 #l9
@@ -2104,14 +2257,14 @@ define-macro ai-insert-block
   set-variable #l0 &sub &add @2 @4 1
   !iif &les #l0 #l6  set-variable #l0 #l6
   !iif &not #l8  !return
-  beginning-of-buffer
-  !repeat
-    !force search-buffer "me" %ai-att-regex
-    !iif &not $status  !break
+  ai-chat-map
+  set-variable #l9 0
+  !while &not &seq &set #l4 &lget %ai-map-atts &inc #l9 1 ""
+    set-variable $window-line #l4
+    !iif &not &xse @wl "@file[ \t]+\\(.*[^ \t\n]\\)[ \t]*"  !continue
     set-variable #l4 @s1
-    set-variable #l9 @s2
-    ai-att-parse #l4 #l9
-    !if &and &seq #l4 "file" &and #l2 &seq #l1 #l5
+    ai-att-parse "file" #l4
+    !if &and #l2 &seq #l1 #l5
       !if &gre #l2 #l7
         set-variable #l2 &add #l2 #l8
         set-variable #l3 &add #l3 #l8
@@ -2120,37 +2273,46 @@ define-macro ai-insert-block
         set-variable #l3 &con &les #l3 #l7 &con &gre #l3 #l0 #l0 #l3 &add #l3 #l8
         !iif &les #l3 #l2  set-variable #l3 #l2
       !endif
-      !if &xse #l9 "\\(.*[^ \t\n]\\)[ \t]*:\\([0-9]+\\)\\(-\\([0-9]+\\)\\)?"
+      !if &xse #l4 "\\(.*[^ \t\n]\\)[ \t]*:\\([0-9]+\\)\\(-\\([0-9]+\\)\\)?"
         set-variable @wl &spr "@file %s%s" @s1 &con &equ #l2 #l3 &spr ":%d" #l2 &spr ":%d-%d" #l2 #l3
       !endif
     !endif
-    end-of-line
   !done
 !emacro
 
 ; fill the empty file or buffer @1 (file or buffer) @2, or create the file, with *ai-edit-r* for
-; edit @4 to @3. Sets #p8 to the status and #p9 to "q" when the user stopped
+; edit @4 to @3, which is attached when @5 is 1. Sets #p8 to the status and #p9 to "q" when the
+; user stopped
 0 define-macro ai-edit-new
   set-variable #l0 $buffer-bname
   set-variable #l1 @1
   set-variable #l2 @2
   set-variable #l3 @3
   set-variable #l4 @4
+  set-variable #l5 @5
   set-variable #p9 ""
   ai-edit-buffer #l1 #l2
-  !if &len #l9
+  set-variable #l6 #l9
+  !if &len #l6
     ; one that is empty is filled as a change to its first line
-    find-buffer #l9
+    find-buffer #l6
     end-of-buffer
-    set-variable #l5 &or &gre $window-line 1 $window-col
+    set-variable #l7 &or &gre $window-line 1 $window-col
     find-buffer #l0
-    !if #l5
+    !if #l7
       set-variable #p8 &spr "failed, the SEARCH text is empty but %s is not" #l3
-    !else
-      ai-edit-do #l9 1 0 #l3 #l4 1
-      set-variable #p8 #l8
-      set-variable #p9 #l9
+      !return
+    !elif &not #l5
+      ai-edit-allow #l2 0 #l4
+      !if &not &seq #l9 "y"
+        set-variable #p8 &spr "skipped, %s is not attached" #l3
+        set-variable #p9 &con &seq #l9 "q" "q" ""
+        !return
+      !endif
     !endif
+    ai-edit-do #l6 1 0 #l3 #l4 1
+    set-variable #p8 #l8
+    set-variable #p9 #l9
     !return
   !elif &seq #l1 "buffer"
     set-variable #p8 &spr "failed, there is no %s" #l3
@@ -2158,14 +2320,12 @@ define-macro ai-insert-block
   !elif &not &seq &stat "t" #l2 "X"
     set-variable #p8 &spr "failed, %s is not a file" #l3
     !return
-  !elif &not %ai-edit-auto
-    !force set-variable #l5 @mc1 &spr "Create %s for edit %d of %d (y/n)? " #l2 #l4 %ai-edit-total "yYnN"
-    !if &not $status
-      set-variable #l5 "n"
-      set-variable #p9 "q"
-    !endif
-    !if &not &iseq #l5 "y"
+  !elif &or &not #l5 &not %ai-edit-auto
+    ; accepting all the changes does not let one create a file
+    ai-edit-allow #l2 1 #l4
+    !if &not &seq #l9 "y"
       set-variable #p8 "rejected"
+      set-variable #p9 &con &seq #l9 "q" "q" ""
       !return
     !endif
   !endif
@@ -2177,8 +2337,38 @@ define-macro ai-insert-block
   !force -1 kill-region
   ai-edit-append "*ai-edit-r*"
   !iif &not &lfind %ai-edit-bufs $buffer-bname  set-variable %ai-edit-bufs &spr "%s%s|" %ai-edit-bufs $buffer-bname
+  end-of-buffer
+  set-variable #l7 &sub $window-line 1
+  ai-undo-add 1 #l7 0 #l3 #l2
   find-buffer #l0
   set-variable #p8 &spr "applied, created %s" #l3
+!emacro
+
+; ask whether file @1, which is not attached, may be changed (@2 0) or created (@2 1) for edit
+; @3, once in a run of edits. Sets #p9 to "y", "n" or "q" when the user stopped
+0 define-macro ai-edit-allow
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  !if &lfind %ai-edit-ok #l1
+    set-variable #p9 "y"
+    !return
+  !elif &lfind %ai-edit-no #l1
+    set-variable #p9 "n"
+    !return
+  !endif
+  !force set-variable #l9 @mc1 &con #l2 &spr "Create %s for edit %d of %d (y/n)? " #l1 #l3 %ai-edit-total &spr "Edit %s, which is not attached (y/n)? " #l1 "yYnN"
+  !if &not $status
+    set-variable #p9 "q"
+    !return
+  !endif
+  set-variable #l9 &slo #l9
+  !if &seq #l9 "y"
+    set-variable %ai-edit-ok &spr "%s%s|" %ai-edit-ok #l1
+  !else
+    set-variable %ai-edit-no &spr "%s%s|" %ai-edit-no #l1
+  !endif
+  set-variable #p9 #l9
 !emacro
 
 ; replace the @3 lines from line @2 of buffer @1 with *ai-edit-r*, re-indented when matched by
@@ -2230,7 +2420,8 @@ define-macro ai-insert-block
   ai-edit-formats "*ai-edit-r*"
   set-variable #l7 &and &len #l7 &not &seq #l7 #l9
   find-buffer %ai-edit-chat
-  !if %ai-edit-auto
+  ; accepting all the changes does not accept one that changes the % formats
+  !if &and %ai-edit-auto &not #l7
     set-variable #l9 "y"
   !else
     !force 0 popup-window #l1
@@ -2243,7 +2434,7 @@ define-macro ai-insert-block
     set-variable $window-line #l2
     recenter
     ; C-g puts the change back and stops, as q
-    !force set-variable #l9 @mc1 &spr "Keep edit %d of %d to %s line %d%s (y/n/a/q)? " #l5 %ai-edit-total #l4 #l2 &con #l7 ", its % formats changed" "" "yYnNaAqQ"
+    !force set-variable #l9 @mc1 &spr "Keep edit %d of %d to %s line %d%s (y/n/a/q)? " #l5 %ai-edit-total #l4 #l2 &con #l7 ", its % formats look changed" "" "yYnNaAqQ"
     !iif &not $status  set-variable #l9 "q"
     set-variable #l9 &slo #l9
     -1 show-region
@@ -2265,23 +2456,54 @@ define-macro ai-insert-block
     !return
   !endif
   !iif &seq #l9 "a"  set-variable %ai-edit-auto 1
-  ; keep an undo record, a header line, holding the buffer's line count after the change and
-  ; the change's line counting any collapsed lines, then the new lines then the old
   find-buffer #l1
   set-variable $window-line #l2
   set-variable #l7 $window-aline
-  end-of-buffer
-  set-variable #l6 $window-line
   set-variable #l9 $buffer-fname
   !iif &not &lfind %ai-edit-bufs #l1  set-variable %ai-edit-bufs &spr "%s%s|" %ai-edit-bufs #l1
-  find-buffer "*ai-undo*"
-  end-of-buffer
-  insert-string &spr "\t%s\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t\n" #l1 #l2 #l8 #l3 #l4 %ai-edit-chat #l6 #l7
-  ai-edit-append "*ai-edit-r*"
-  ai-edit-append "*ai-edit-o*"
+  ai-undo-add #l2 #l8 #l3 #l4 ""
   find-buffer %ai-edit-chat
   !iif &len #l9  ai-att-shift #l9 #l7 #l3 #l8
   set-variable #p8 &spr "applied, %s line %d" #l4 #l7
+!emacro
+
+; keep an undo record for the change at line @1 of the current buffer, now @2 lines that were the
+; @3 lines of *ai-edit-o*, to @4 (its label), or for the creation of file @5 when not "". The
+; record's header line holds the buffer's line count after the change, the change's line counting
+; any collapsed lines and, for a removal, the number of lines kept before and after it. The lines
+; it is checked by follow, a removal's up to 3 either side else the new lines, then the old lines
+0 define-macro ai-undo-add
+  set-variable #l0 $buffer-bname
+  set-variable #l1 @1
+  set-variable #l2 @2
+  set-variable #l3 @3
+  set-variable #l4 @4
+  set-variable #l5 @5
+  set-variable $window-line #l1
+  set-variable #l6 $window-aline
+  end-of-buffer
+  set-variable #l7 $window-line
+  set-variable #l8 0
+  set-variable #l9 0
+  !if &not #l2
+    set-variable #l8 &sub #l1 1
+    !iif &gre #l8 3  set-variable #l8 3
+    set-variable #l9 &sub #l7 #l1
+    !iif &gre #l9 3  set-variable #l9 3
+  !endif
+  ai-edit-copy &sub #l1 #l8 &add &add #l1 #l2 #l9 "*ai-edit-t*"
+  ; the last batch is kept until a change of this one is
+  !if &or %ai-undo-new &not &exi ":*ai-undo*:"
+    ai-temp-buffer "*ai-undo*"
+    set-variable %ai-undo-new 0
+  !endif
+  find-buffer "*ai-undo*"
+  end-of-buffer
+  insert-string &spr "\t%s\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t\n" #l0 #l1 #l2 #l3 #l4 %ai-edit-chat #l7 #l6 #l8 #l9 #l5
+  ai-edit-append "*ai-edit-t*"
+  !iif #l3  ai-edit-append "*ai-edit-o*"
+  !force 0 delete-buffer "*ai-edit-t*"
+  find-buffer #l0
 !emacro
 
 ; insert the text of buffer @2 at the start of line @1 of the current buffer
@@ -2324,18 +2546,16 @@ define-macro ai-insert-block
   set-variable #l7 &sub $window-line 1
   find-buffer %ai-edit-chat
   !if &not #l7
-    ai-edit-new #l1 #l2 #l5 #l6
+    ai-edit-new #l1 #l2 #l5 #l6 #l4
     set-variable #p8 #l8
     set-variable #p9 #l9
     !return
-  !elif &and &not #l4 &not %ai-edit-auto
-    !force set-variable #l9 @mc1 &spr "Edit %s, which is not attached (y/n)? " #l2 "yYnN"
-    !if &not $status
-      set-variable #l9 "n"
-      set-variable #p9 "q"
-    !endif
-    !if &not &iseq #l9 "y"
+  !elif &not #l4
+    ; accepting all the changes does not let one change a file that is not attached
+    ai-edit-allow #l2 0 #l6
+    !if &not &seq #l9 "y"
       set-variable #p8 &spr "skipped, %s is not attached" #l5
+      set-variable #p9 &con &seq #l9 "q" "q" ""
       !return
     !endif
   !endif
@@ -2420,7 +2640,11 @@ define-macro ai-insert-block
   set-variable %ai-edit-kept 0
   set-variable %ai-edit-bad 0
   set-variable %ai-edit-bufs "|"
-  ai-temp-buffer "*ai-undo*"
+  ; the files not attached that the user let the changes edit or create, or would not
+  set-variable %ai-edit-ok "|"
+  set-variable %ai-edit-no "|"
+  ; the undo records of the last run are replaced once a change of this one is kept
+  set-variable %ai-undo-new 1
   find-buffer %ai-edit-chat
   ; status lines written for one block move the lines of the blocks after it
   set-variable #l3 0
@@ -2500,25 +2724,39 @@ define-macro ai-undo-edits
   set-variable #l1 "|"
   !while &not &seq @wc ""
     set-variable #l1 &spr "|%d%s" $window-line #l1
-    set-variable $window-line &add &add $window-line 1 &add &lget @wl 3 &lget @wl 4
+    set-variable #l2 @wl
+    set-variable $window-line &add &add $window-line 1 &add &add &lget #l2 3 &lget #l2 4 &add &lget #l2 9 &lget #l2 10
   !done
+  ; #l2 undone, #l3 changed since, #l6 read only, #l7 failed
   set-variable #l2 0
   set-variable #l3 0
+  set-variable #l6 0
+  set-variable #l7 0
   set-variable #l4 0
   !while &not &seq &set #l5 &lget #l1 &inc #l4 1 ""
     find-buffer "*ai-undo*"
     set-variable $window-line #l5
-    ai-undo-one #l5
-    !if $result
+    ; a failure leaves the other records to be undone
+    !force ai-undo-one #l5
+    !if &not $status
+      set-variable #l7 &add #l7 1
+    !elif &equ $result 1
       set-variable #l2 &add #l2 1
+    !elif &equ $result 2
+      set-variable #l6 &add #l6 1
     !else
       set-variable #l3 &add #l3 1
     !endif
   !done
   !force 0 delete-buffer "*ai-undo*"
   !force 0 delete-buffer "*ai-edit-s*"
+  !force 0 delete-buffer "*ai-edit-t*"
+  !force 0 delete-buffer "*ai-edit-o*"
   find-buffer #l0
-  ml-write &spr "[AI: %d edit%s undone%s]" #l2 &con &equ #l2 1 "" "s" &con #l3 &spr ", %d changed since so left" #l3 ""
+  set-variable #l8 &con #l3 &spr ", %d changed since so left" #l3 ""
+  !iif #l6  set-variable #l8 &spr "%s, %d read only so left" #l8 #l6
+  !iif #l7  set-variable #l8 &spr "%s, %d failed" #l8 #l7
+  ml-write &spr "[AI: %d edit%s undone%s]" #l2 &con &equ #l2 1 "" "s" #l8
 !emacro
 
 ; set #p3 to the first line of the one place in buffer @1 holding exactly the @2 lines of
@@ -2530,8 +2768,10 @@ define-macro ai-undo-edits
   set-variable #p3 &con &equ #l3 1 #l1 0
 !emacro
 
-; undo the edit whose record starts on line @1 of *ai-undo*, $result is 0 when its lines have
-; changed since. When lines have been added or removed above them the new lines are looked for
+; undo the edit whose record starts on line @1 of *ai-undo*, $result is 1 when it is undone, 2
+; when its buffer is read only and 0 when its lines have changed since. It is checked by the new
+; lines, or for a removal the lines around it, which are looked for when lines have been added or
+; removed. A created file's buffer is deleted when unchanged and the file has not been saved
 0 define-macro ai-undo-one
   set-variable #l1 @1
   set-variable #l9 @wl
@@ -2539,56 +2779,81 @@ define-macro ai-undo-edits
   set-variable #l3 &lget #l9 2
   set-variable #l4 &lget #l9 3
   set-variable #l5 &lget #l9 4
+  ; #l8 the lines kept before a removal, #l7 all the lines it is checked by
+  set-variable #l8 &lget #l9 9
+  set-variable #l7 &add &add #l4 #l8 &lget #l9 10
   set-variable $result 0
   !iif &not &exi &spr ":%s:" #l2  !return
-  ; compare the new lines with the buffer's
+  find-buffer #l2
+  !if &len &lget #l9 11
+    ; a created file, its buffer is still for it and the file is not saved
+    set-variable #l6 &and &seq $buffer-fname &lget #l9 11 &seq &stat "t" &lget #l9 11 "X"
+  !else
+    set-variable #l6 1
+  !endif
+  set-variable #l0 &bmo "view"
+  find-buffer "*ai-undo*"
+  !iif &not #l6  !return
+  !if #l0
+    set-variable $result 2
+    !return
+  !endif
   set-variable #l6 &add #l1 1
-  set-variable #l7 &add #l6 #l4
-  ai-edit-copy #l6 #l7 "*ai-edit-s*"
+  ai-edit-copy #l6 &add #l6 #l7 "*ai-edit-s*"
   find-buffer #l2
   end-of-buffer
   set-variable #l6 0
   !if &equ $window-line &lget #l9 7
-    ai-edit-copy #l3 &add #l3 #l4 "*ai-edit-t*"
+    ai-edit-copy &sub #l3 #l8 &add &sub #l3 #l8 #l7 "*ai-edit-t*"
     find-buffer "*ai-edit-s*"
     end-of-buffer
     ai-edit-append "*ai-edit-t*"
-    !force 0 delete-buffer "*ai-edit-t*"
-    ai-edit-same #l4 1
+    ai-edit-same #l7 1
     set-variable #l6 $result
   !endif
-  !if &and &not #l6 #l4
-    ai-undo-find #l2 #l4
-    set-variable #l6 #l3
+  ; moved by lines added or removed, a created file is not looked for
+  !if &and &not #l6 &and #l7 &not &len &lget #l9 11
+    ai-undo-find #l2 #l7
+    !if #l3
+      set-variable #l3 &add #l3 #l8
+      set-variable #l6 1
+    !endif
   !endif
   set-variable $result 0
   !iif &not #l6  !return
-  ; the old lines back in place of the new
-  find-buffer "*ai-undo*"
-  set-variable #l6 &add &add #l1 1 #l4
-  set-variable #l7 &add #l6 #l5
-  ai-edit-copy #l6 #l7 "*ai-edit-o*"
-  find-buffer #l2
-  !if #l4
-    set-variable $window-line #l3
-    set-mark
-    set-variable $window-line &add #l3 #l4
-    -1 kill-region
-  !endif
-  ai-edit-append-at #l3 "*ai-edit-o*"
-  set-variable $window-line #l3
-  set-variable #l3 $window-aline
-  set-variable #l8 $buffer-fname
-  !force 0 delete-buffer "*ai-edit-o*"
-  ; the chat's ranges and the edit's status
   set-variable #l6 &lget #l9 6
+  !if &len &lget #l9 11
+    0 delete-buffer #l2
+    set-variable #l7 &spr "created %s" &lget #l9 5
+  !else
+    ; the old lines back in place of the new
+    find-buffer "*ai-undo*"
+    set-variable #l7 &add &add #l1 1 #l7
+    ai-edit-copy #l7 &add #l7 #l5 "*ai-edit-o*"
+    find-buffer #l2
+    !if #l4
+      set-variable $window-line #l3
+      set-mark
+      set-variable $window-line &add #l3 #l4
+      -1 kill-region
+    !endif
+    ai-edit-append-at #l3 "*ai-edit-o*"
+    set-variable $window-line #l3
+    set-variable #l3 $window-aline
+    set-variable #l8 $buffer-fname
+    ; the chat's ranges
+    !if &and &len #l8 &exi &spr ":%s:" #l6
+      find-buffer #l6
+      ai-att-shift #l8 #l3 #l4 #l5
+    !endif
+    set-variable #l7 &spr "%s line %d" &lget #l9 5 &lget #l9 8
+  !endif
+  ; the edit's status
   !if &exi &spr ":%s:" #l6
     find-buffer #l6
-    !iif &len #l8  ai-att-shift #l8 #l3 #l4 #l5
-    set-variable #l7 &lget #l9 5
     str-to-regex #l7
     beginning-of-buffer
-    !force search-buffer "me" &spr "^(edit \\([0-9]+\\) applied, \\(%s line %d\\))$" #l7 &lget #l9 8
+    !force search-buffer "me" &spr "^(edit \\([0-9]+\\) applied, \\(%s\\))$" #l7
     !iif $status  set-variable @wl &spr "(edit %s undone, %s)" @s1 @s2
   !endif
   find-buffer "*ai-undo*"
@@ -2776,6 +3041,10 @@ define-macro ai-set-model
   !endif
   !iif &seq #l1 ""  !abort
   set-variable %ai-model #l1
-  set-registry "/history/ai-chat/model" #l1
+  !if &not &seq #l1 &reg "/history/ai-chat/model" ""
+    set-registry "/history/ai-chat/model" #l1
+    ; set-registry does not flag the history as changed, so it would not be saved
+    !iif &not &seq &lef &reg "/history" "" 6 "tfs://"  !force mark-registry "/history" "u"
+  !endif
   ml-write &spr "[AI: using model %s]" #l1
 !emacro
