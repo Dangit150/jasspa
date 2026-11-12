@@ -205,8 +205,12 @@ chat is sent with every question, so earlier questions and answers may be edited
 or deleted to change what the model sees, and the chat may be carried on later
 from any buffer holding these lines. A \fC## System\fR part replaces the system
 prompt given by \fB%ai-system-prompt\fR. The buffer uses the markdown major mode
-so the code blocks in a reply are hilighted, the hilighting is worked out from
-the top of the buffer so the colours do not change as the chat is scrolled.
+with a hilighting of its own, worked out from the top of the buffer so the
+colours do not change as the chat is scrolled. Only a fenced code block carries
+on from one line to the next, its fences found as above, while emphasis, links,
+strings and comments end with their line, so code pasted outside a block cannot
+spoil the colours of the rest of the chat. Code blocks are drawn in one colour,
+as a language's own hilighting could leave a string open past the block's end.
 .PP
 Some of the chat is the editor's and is not sent back as the model's words: a
 note such as \fC[AI: cancelled]\fR or \fC[AI error: ...]\fR, a reply's thinking
@@ -739,6 +743,11 @@ Nothing is sent unless one of the commands above is run, but everything in the
 chat, including the text of every attached file and what the attached commands
 write, is then sent to the server. Saved chats hold the chat's text, not that of
 its attachments.
+.PP
+Killing a chat buffer saves the chat, stops a request still writing into it and removes the
+buffers the editor made for it, and the rest of them once no chat is left, but not the record
+.B ai-undo-edits
+uses.
 .PP
 A \fC@cmd\fR line runs a shell command whenever its question is sent, so a chat
 written by someone else is worth reading first; each command is asked about the

@@ -323,28 +323,181 @@ define-macro ai-chat-keys
   ai-chat-setup
 !emacro
 
+; the chat's hilighting, markdown in which only code fences carry over from one line to the next.
+; Pasted code often opens md's emphasis, link, string or comment and never closes it, which
+; would spoil every line below as the chat looks back to its top. Looking back to the top keeps
+; code and prose from swapping colours as the chat scrolls, a redraw at the end of a 6000 line
+; chat takes under 3ms. Fences are found as the chat finds them, at the first non-white
+; character and closed by a line of at least as many of the same character, and code is drawn
+; in one colour as a language's own hilighting could leave a string open past its fence
+0 define-macro ai-chat-hilight
+  set-variable .hilight.aichat &pinc .hilight.next 1
+  set-variable .hilight.aichatE &pinc .hilight.next 1
+  set-variable .hilight.aichatB &pinc .hilight.next 1
+  set-variable .hilight.aichatI &pinc .hilight.next 1
+  set-variable .hilight.aichatBI &pinc .hilight.next 1
+  set-variable .hilight.aichatH &pinc .hilight.next 1
+  set-variable .hilight.aichatA &pinc .hilight.next 1
+  set-variable .hilight.aichatL &pinc .hilight.next 1
+  set-variable .hilight.aichatU &pinc .hilight.next 1
+  set-variable .hilight.aichatC3 &pinc .hilight.next 1
+  set-variable .hilight.aichatC4 &pinc .hilight.next 1
+  set-variable .hilight.aichatT &pinc .hilight.next 1
+  set-variable .hilight.aichatM &pinc .hilight.next 1
+  0 hilight .hilight.aichat 2 1000000 $global-scheme
+  ; role and heading lines, the key list at the top, other comments and strings on one line
+  hilight .hilight.aichat 2 "^#" .scheme.header
+  hilight .hilight.aichat 0x104 "<!-- AI chat" "-->" "" .scheme.comment
+  hilight .hilight.aichat 0x1880 "<!--" .hilight.aichatM .scheme.comment
+  hilight .hilight.aichat 0 "\"[^\"]*\"" .scheme.string
+  ; the branches of emphasis, highlights and links end with the line (0x1000)
+  hilight .hilight.aichat 0x1890 "\\\\\\}[-[-\\]`*_{}<>()#+.!|]" .hilight.aichatE .scheme.hide
+  hilight .hilight.aichat 0x1890 "\\*\\}\\S" .hilight.aichatI .scheme.hide
+  hilight .hilight.aichat 0x1890 "\\W\\{_\\}\\S" .hilight.aichatI .scheme.hide
+  hilight .hilight.aichat 0x1890 "\\*\\*\\}\\S" .hilight.aichatB .scheme.hide
+  hilight .hilight.aichat 0x1890 "\\W\\{__\\}\\S" .hilight.aichatB .scheme.hide
+  hilight .hilight.aichat 0 "\\*\\*\\*+" $global-scheme
+  hilight .hilight.aichat 0 "___+" $global-scheme
+  hilight .hilight.aichat 0x1890 "!\\[" .hilight.aichatA .scheme.hide
+  hilight .hilight.aichat 0x1890 "\\[" .hilight.aichatL .scheme.hide
+  hilight .hilight.aichat 0x1890 "==\\}\\S" .hilight.aichatH .scheme.hide
+  hilight .hilight.aichat 0 "===+" $global-scheme
+  hilight .hilight.aichat 0 "file:[-@~_a-zA-Z#%=\\\\.:\\/0-9]+" .scheme.link
+  hilight .hilight.aichat 0 "https?://[-@~_a-zA-Z#%?&=.:\\/0-9]+" .scheme.link
+  hilight .hilight.aichat 0 "ftps?://[-@~_a-zA-Z#%.:\\/0-9]+" .scheme.link
+  hilight .hilight.aichat 0 "mailto:[-@~_a-zA-Z#%.:\\/0-9]+" .scheme.link
+  hilight .hilight.aichat 0x20 "\\-\\} " .scheme.keyword
+  hilight .hilight.aichat 0x20 "\\d+\\.\\} " .scheme.keyword
+  hilight .hilight.aichat 0 "\\[^\\{\\d+\\}]" .scheme.link
+  hilight .hilight.aichat 0x20 "\\[^\\d+]:" .scheme.bold
+  hilight .hilight.aichat 0x20 "- \\{\\[ ] " .scheme.bold
+  hilight .hilight.aichat 0x20 "- \\{\\[X] " .scheme.bold
+  hilight .hilight.aichat 1 "`[^`]+`" .scheme.code
+  hilight .hilight.aichat 1 "`` `[^`]+` ``" .scheme.code
+  ; code fences, a fence of backticks has none after them
+  hilight .hilight.aichat 0xa0 "````[^`]*$" .hilight.aichatC4 .scheme.hide
+  hilight .hilight.aichat 0xa0 "```[^`]*$" .hilight.aichatC3 .scheme.hide
+  hilight .hilight.aichat 0xa0 "~~~.*" .hilight.aichatT .scheme.hide
+  0 hilight .hilight.aichatC3 0 .scheme.code
+  hilight .hilight.aichatC3 0xa0 "```+[ \t]*$" .hilight.aichat .scheme.hide
+  0 hilight .hilight.aichatC4 0 .scheme.code
+  hilight .hilight.aichatC4 0xa0 "````+[ \t]*$" .hilight.aichat .scheme.hide
+  0 hilight .hilight.aichatT 0 .scheme.code
+  hilight .hilight.aichatT 0xa0 "~~~+[ \t]*$" .hilight.aichat .scheme.hide
+  ; inside a branch every branch also ends with the line, as the last one taken decides
+  0 hilight .hilight.aichatM 0 .scheme.comment
+  hilight .hilight.aichatM 0x1080 "-->" .hilight.aichat .scheme.comment
+  0 hilight .hilight.aichatE 0 $global-scheme
+  hilight .hilight.aichatE 0x1080 "." .hilight.aichat $global-scheme
+  0 hilight .hilight.aichatB 0 .scheme.bold
+  hilight .hilight.aichatB 0 "\\\\." .scheme.bold
+  hilight .hilight.aichatB 0x1080 "\\*\\*" .hilight.aichat .scheme.hide
+  hilight .hilight.aichatB 0x1080 "__\\}\\W" .hilight.aichat .scheme.hide
+  hilight .hilight.aichatB 0x1080 "\\*" .hilight.aichatBI .scheme.hide
+  hilight .hilight.aichatB 0x1080 "\\W\\{_\\}\\S" .hilight.aichatBI .scheme.hide
+  0 hilight .hilight.aichatI 0 .scheme.italic
+  hilight .hilight.aichatI 0 "\\\\." .scheme.italic
+  hilight .hilight.aichatI 0x1080 "\\*" .hilight.aichat .scheme.hide
+  hilight .hilight.aichatI 0x1080 "_\\}\\W" .hilight.aichat .scheme.hide
+  hilight .hilight.aichatI 0x1080 "\\*\\*" .hilight.aichatBI .scheme.hide
+  hilight .hilight.aichatI 0x1080 "\\W\\{__\\}\\S" .hilight.aichatBI .scheme.hide
+  0 hilight .hilight.aichatBI 0 .scheme.bold-italic
+  hilight .hilight.aichatBI 0 "\\\\." .scheme.bold-italic
+  hilight .hilight.aichatBI 0x1080 "\\*\\*" .hilight.aichatI .scheme.hide
+  hilight .hilight.aichatBI 0x1080 "__\\}\\W" .hilight.aichatI .scheme.hide
+  hilight .hilight.aichatBI 0x1080 "\\*" .hilight.aichatB .scheme.hide
+  hilight .hilight.aichatBI 0x1080 "_\\}\\W" .hilight.aichatB .scheme.hide
+  0 hilight .hilight.aichatH 0 .scheme.hlblue
+  hilight .hilight.aichatH 0 "\\\\." .scheme.bold
+  hilight .hilight.aichatH 0x1080 "==" .hilight.aichat .scheme.hide
+  0 hilight .hilight.aichatA 0 $global-scheme
+  hilight .hilight.aichatA 0 "\\\\." .scheme.link
+  hilight .hilight.aichatA 0x1080 "](" .hilight.aichatU .scheme.hide
+  hilight .hilight.aichatA 0x1080 "]" .hilight.aichat .scheme.error
+  0 hilight .hilight.aichatL 0 .scheme.link
+  hilight .hilight.aichatL 0 "\\\\." .scheme.link
+  hilight .hilight.aichatL 0x1080 "](" .hilight.aichatU .scheme.hide
+  hilight .hilight.aichatL 0x1080 "]" .hilight.aichat .scheme.error
+  0 hilight .hilight.aichatU 0 .scheme.hide
+  hilight .hilight.aichatU 0 "\\\\." .scheme.hide
+  hilight .hilight.aichatU 0x1080 ")" .hilight.aichat .scheme.hide
+!emacro
+
 ; make the current buffer a chat
 0 define-macro ai-chat-setup
   !if &not &exi :ai-chat
     ; markdown fills an empty buffer with its file template
     !iif &les $window-eline 2  ai-chat-init
     !force major-mode "md"
-    ; md hilighting starts 100 lines above the window as if outside a code block, when
-    ; that line is in one code and prose swap colours as the chat scrolls. This root
-    ; scheme looks back to the top of the buffer and branches into md with a zero width
-    ; token, a scroll costs under 1ms more in a 6000 line chat
+    ; the chat's own hilighting replaces md's, unless md's is turned off
     !if &and &exi .hilight.md &equ $buffer-hilight .hilight.md
-      !if &not &exi .hilight.aichat
-        set-variable .hilight.aichat &pinc .hilight.next 1
-        0 hilight .hilight.aichat 2 1000000 $global-scheme
-        hilight .hilight.aichat 0x80 "\\}." .hilight.md $global-scheme
-      !endif
+      !iif &not &exi .hilight.aichat  ai-chat-hilight
       set-variable $buffer-hilight .hilight.aichat
     !endif
     set-variable :ai-chat 1
     set-variable .ai-chat.key-list 0
     ai-chat-key-table
+    ; clean up when the chat is killed, after any delete hook the buffer had
+    set-variable :ai-dhook $buffer-dhook
+    set-variable $buffer-dhook ai-chat-dhook
   !endif
+!emacro
+
+; the delete hook of a chat buffer: the chat is saved, a request still writing into it is stopped
+; and the buffers left by its requests are removed, the rest once no chat is left
+0 define-macro ai-chat-dhook
+  set-variable #l0 $buffer-bname
+  set-variable #l1 :ai-dhook
+  !force ai-chat-save
+  !iif &and .ai-send.busy &seq .ai-send.target #l0  ai-abandon
+  !if &not .ai-send.busy
+    !force 0 delete-buffer "*ai-stream*"
+    !force 0 delete-buffer "*ai-response*"
+  !endif
+  ; a review of this chat's edits and a command's output shown from it
+  !if &exi ":*ai-diff*:"
+    !if &seq &ind ":*ai-diff*:ai-diff-chat" #l0
+      !force 0 delete-buffer "*ai-diff*"
+      !force 0 delete-buffer "*ai-diff-edits*"
+    !endif
+  !endif
+  !iif &seq .ai-attach.chat #l0  !force 0 delete-buffer "*ai-attachment*"
+  ; the other chats, which do not include this one once its name is changed
+  set-variable $buffer-names "^\\*ai-chat\\(:.*\\)?\\*$"
+  set-variable #l2 0
+  !while &not &seq &set #l3 $buffer-names ""
+    !iif &not &seq #l3 #l0  set-variable #l2 &add #l2 1
+  !done
+  !if &not #l2
+    !force 0 delete-buffer "*ai-models*"
+    !force 0 delete-buffer "*ai-chats*"
+  !endif
+  !iif &seq .ai-chat.current #l0  set-variable .ai-chat.current "*ai-chat*"
+  !iif &len #l1  !force execute-named-command #l1
+!emacro
+
+; end the request of a chat that is being killed, its reply has nowhere to go. Killing the pipe's
+; buffer stops curl, and its last call is not run
+0 define-macro ai-abandon
+  set-variable .ai-send.abandon 1
+  !force -1 create-callback ai-retry-send
+  !force -1 create-callback ai-tick
+  !force 0 delete-buffer "*ai-stream*"
+  !force 0 delete-buffer "*ai-response*"
+  !iif &len .ai-send.req-file  !force 0x20 file-op .ai-send.req-file
+  !iif &len .ai-send.hdr-file  !force 0x20 file-op .ai-send.hdr-file
+  set-variable .ai-send.req-file ""
+  set-variable .ai-send.hdr-file ""
+  set-variable .ai-send.req-key ""
+  set-variable .ai-send.retry-at 0
+  !force 0 delete-buffer "*ai-tc*"
+  set-variable #l1 0
+  !while &les #l1 .ai-send.tc-n
+    !force 0 delete-buffer &spr "*ai-tc-%d*" #l1
+    set-variable #l1 &add #l1 1
+  !done
+  set-variable .ai-send.busy 0
+  ml-write "[AI: the chat was killed, its request is stopped]"
 !emacro
 
 ; leave the point at the end of the buffer after exactly one blank line
@@ -2189,10 +2342,8 @@ define-macro ai-chat
     set-variable .ai-send.think 3
   !endif
   set-variable #l1 &and .ai-send.tc-n &not .ai-send.cancel
-  !if .ai-send.tc-n
-    !iif #l1  ai-tc-write
-    !force 0 delete-buffer "*ai-tc*"
-  !endif
+  !iif #l1  ai-tc-write
+  !force 0 delete-buffer "*ai-tc*"
   !iif .ai-send.got  ai-reply-unstatus
   !iif %ai-wrap  !force ai-wrap-reply
   ai-reply-role
@@ -2556,6 +2707,7 @@ define-macro ai-chat
 0 define-macro ai-stream-ipipe
   set-variable #l9 $result
   set-variable #l8 @#
+  !iif .ai-send.abandon  !return
   ; any output means curl has read the key, the pipe is called before that too
   !if &and &len .ai-send.hdr-file &gre $window-eline 1
     !force 0x20 file-op .ai-send.hdr-file
@@ -2632,6 +2784,7 @@ define-macro ai-chat
   set-alpha-mark "\xa4"
   set-alpha-mark "\xa5"
   set-variable .ai-send.busy 1
+  set-variable .ai-send.abandon 0
   set-variable .ai-send.got 0
   set-variable .ai-send.cancel 0
   set-variable .ai-send.failed 0
@@ -6053,7 +6206,9 @@ define-macro ai-cancel
 0 define-macro ai-model-list
   set-variable #l0 $buffer-bname
   set-variable #p9 0
-  !if &and &not @1 &and &seq .ai-set-model.models-url %ai-base-url &exi ":*ai-models*:"
+  !force set-variable #l8 @1
+  !iif &not $status  set-variable #l8 0
+  !if &and &not #l8 &and &seq .ai-set-model.models-url %ai-base-url &exi ":*ai-models*:"
     find-buffer "*ai-models*"
     end-of-buffer
     set-variable #p9 &sub $window-line 1
@@ -6167,6 +6322,7 @@ set-variable .ai-chat.edit-status "(edit [0-9]+ [a-z]+.*"
 set-variable .ai-chat.map-regex &spr "^\\(%s\\|[ \t]*\\(```\\|~~~\\).*\\|%s\\)$" .ai-chat.role-re .ai-chat.att-line
 set-variable .ai-chat.fence-regex "^[ \t]*\\(```\\|~~~\\)"
 set-variable .ai-send.busy 0
+set-variable .ai-send.abandon 0
 set-variable .ai-chat.spaces "                                                                "
 set-variable .ai-insert-block.src ""
 set-variable .ai-insert-block.src-region 0
