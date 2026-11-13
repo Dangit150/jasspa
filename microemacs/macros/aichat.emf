@@ -442,8 +442,17 @@ define-macro ai-chat-keys
   set-variable .hilight.aichatT &pinc .hilight.next 1
   set-variable .hilight.aichatM &pinc .hilight.next 1
   0 hilight .hilight.aichat 2 1000000 $global-scheme
-  ; role and heading lines, the key list at the top, other comments and strings on one line
+  ; role lines, each role in its own colour apart from the headings, a comment after one, such
+  ; as the model that wrote a reply, drawn as any other. The key list at the top, other
+  ; comments and strings on one line
   hilight .hilight.aichat 2 "^#" .scheme.header
+  hilight .hilight.aichat 0 "^## You$" .scheme.hlyellow
+  hilight .hilight.aichat 0 "^## You\\}[ \t]" .scheme.hlyellow
+  hilight .hilight.aichat 0 "^## AI$" .scheme.hlcyan
+  hilight .hilight.aichat 0 "^## AI\\}[ \t]" .scheme.hlcyan
+  hilight .hilight.aichat 0 "^## System$" .scheme.hlmagenta
+  hilight .hilight.aichat 0 "^## System\\}[ \t]" .scheme.hlmagenta
+  hilight .hilight.aichat 0 "^## Tool[ \t]+[-_.:A-Za-z0-9]+" .scheme.hlgreen
   hilight .hilight.aichat 0x104 "<!-- AI chat" "-->" "" .scheme.comment
   hilight .hilight.aichat 0x1880 "<!--" .hilight.aichatM .scheme.comment
   hilight .hilight.aichat 0 "\"[^\"]*\"" .scheme.string
@@ -2376,6 +2385,22 @@ define-macro ai-chat
   !endif
 !emacro
 
+; keep the point of the chat in the current buffer in alpha mark \xaf, $result is 1 when it is at
+; the end of the reply (alpha mark \xa4) or of the buffer, following what is added there, so the
+; point is put back afterwards only when the user has moved away to read
+0 define-macro ai-point-keep
+  set-variable #l1 $window-line
+  set-variable #l2 $window-col
+  set-alpha-mark "\xaf"
+  set-variable #l3 0
+  !force goto-alpha-mark "\xa4"
+  !iif &and $status &and &equ $window-line #l1 &equ $window-col #l2  set-variable #l3 1
+  end-of-buffer
+  !iif &and &equ $window-line #l1 &equ $window-col #l2  set-variable #l3 1
+  goto-alpha-mark "\xaf"
+  set-variable $result #l3
+!emacro
+
 0 define-macro ai-target-insert
   set-variable #l0 $buffer-bname
   set-variable #l1 @1
@@ -2855,6 +2880,10 @@ define-macro ai-chat
   ai-request-clear
   ai-tick-stop
   find-buffer .ai-send.target
+  ; where the user has the point and the view, put back at the end unless it follows the reply
+  ai-point-keep
+  set-variable #l8 $result
+  0x08 set-position "\xb3"
   ; a question typed below the reply as it came is taken out, to go after it, #l3 is 1 when
   ; there is one and #l4 when it starts with its own "## You" line
   ai-typed-take
@@ -2931,6 +2960,11 @@ define-macro ai-chat
     set-variable #l2 &spr ", %d in + %d out tokens, the chat %d + %d" .ai-send.usage-in .ai-send.usage-out :ai-tokens-in :ai-tokens-out
   !else
     set-variable #l2 ""
+  !endif
+  ; not where the next question goes when the user moved away to read, or to write elsewhere
+  !if &not &or #l8 #l3
+    goto-alpha-mark "\xaf"
+    0x08 goto-position "\xb3"
   !endif
   !force ai-chat-save
   find-buffer #l0
@@ -3767,7 +3801,17 @@ define-macro ai-send
 ; size. The size of the JSON is a little more, as its text is escaped
 define-macro ai-preview
   ai-busy-check
-  !iif &not &exi :ai-chat  ai-chat
+  ; from another buffer the chat last used is built out of sight, the window keeps its buffer and
+  ; view and only the preview is shown
+  set-variable #l8 &not &exi :ai-chat
+  !if #l8
+    !if &not &exi &spr ":%s:" .ai-chat.current
+      ml-write "[AI: there is no chat]"
+      !abort
+    !endif
+    0xbf set-position "\xb2"
+    find-buffer .ai-chat.current
+  !endif
   set-variable #l0 $buffer-bname
   ai-chat-settings-use #l0
   set-variable #l1 %ai-transport
@@ -3778,6 +3822,7 @@ define-macro ai-preview
   0xc0 goto-position "\xad"
   !if &not #l2
     !force 0 delete-buffer "*ai-req*"
+    !iif #l8  goto-position "\xb2"
     ml-write "[AI Error: the request could not be built]"
     !abort
   !endif
@@ -3811,7 +3856,11 @@ define-macro ai-preview
   -1 buffer-mode "edit"
   1 buffer-mode "view"
   beginning-of-buffer
-  find-buffer #l0
+  !if #l8
+    goto-position "\xb2"
+  !else
+    find-buffer #l0
+  !endif
   !force 0 popup-window "*ai-request*"
   !iif &not $status  1 popup-window "*ai-request*"
   ml-write &spr "[AI: about %s tokens to %s, nothing sent]" #l5 &con &len %ai-model %ai-model "no model"
@@ -4038,37 +4087,39 @@ define-macro ai-attach
   set-variable #l7 0
   set-variable #l8 0
   set-variable #l0 ""
-  set-variable #l1 $window-line
-  set-variable #l2 $window-col
-  ; get-next-line 6 parses the next hit in this buffer only and does not open its file
-  !force backward-line
-  !force 6 get-next-line
-  !if &and $status &equ $window-line #l1
-    set-variable #l3 :next-line
-    set-variable #l6 :next-file
-    set-variable #l5 "file"
-    !if &and &seq &lef #l6 1 "*" &seq &rig #l6 &sub &len #l6 1 "*"
-      set-variable #l5 "buffer"
-      set-variable #l6 &mid #l6 1 &sub &len #l6 2
+  ; a region the user selected, read first as moving the point ends it
+  ai-get-region
+  !if #l9
+    0xc0 set-position "\xa6"
+    set-variable $window-line #l1
+    set-variable #l7 $window-aline
+    set-variable $window-line &sub #l3 &not #l4
+    set-variable #l8 $window-aline
+    !iif &les #l8 #l7  set-variable #l8 #l7
+    0xc0 goto-position "\xa6"
+  !else
+    set-variable #l1 $window-line
+    set-variable #l2 $window-col
+    ; get-next-line 6 parses the next hit in this buffer only and does not open its file
+    !force backward-line
+    !force 6 get-next-line
+    !if &and $status &equ $window-line #l1
+      set-variable #l3 :next-line
+      set-variable #l6 :next-file
+      set-variable #l5 "file"
+      !if &and &seq &lef #l6 1 "*" &seq &rig #l6 &sub &len #l6 1 "*"
+        set-variable #l5 "buffer"
+        set-variable #l6 &mid #l6 1 &sub &len #l6 2
+      !endif
+      set-variable #l7 &sub #l3 %ai-attach-lines
+      !iif &les #l7 1  set-variable #l7 1
+      set-variable #l8 &add #l3 %ai-attach-lines
+      ai-att-lines #l5 #l6
+      !iif &and #l9 &gre #l8 #l9  set-variable #l8 #l9
     !endif
-    set-variable #l7 &sub #l3 %ai-attach-lines
-    !iif &les #l7 1  set-variable #l7 1
-    set-variable #l8 &add #l3 %ai-attach-lines
-    ai-att-lines #l5 #l6
-    !iif &and #l9 &gre #l8 #l9  set-variable #l8 #l9
-  !endif
-  set-variable $window-line #l1
-  set-variable $window-col #l2
-  !if &not #l7
-    ai-get-region
-    !if #l9
-      0xc0 set-position "\xa6"
-      set-variable $window-line #l1
-      set-variable #l7 $window-aline
-      set-variable $window-line &sub #l3 &not #l4
-      set-variable #l8 $window-aline
-      !iif &les #l8 #l7  set-variable #l8 #l7
-      0xc0 goto-position "\xa6"
+    set-variable $window-line #l1
+    set-variable $window-col #l2
+    !if #l7
     !elif &seq $buffer-major-mode "diff"
       ; a diff, such as *svn-diff*, is attached by the changes to one of its files
       !force set-variable #l9 @mc1 "Attach the changes to the file at the point or the whole diff (f/w)? " "fFwW" "f"
@@ -4085,24 +4136,24 @@ define-macro ai-attach
     !else
       !force set-variable #l9 @mc1 "Attach the function at the point or the whole file (f/w)? " "fFwW" "f"
       !iif &not $status  !abort
-    !endif
-    !if &or #l7 &seq $buffer-major-mode "diff"
-    !elif &iseq #l9 "f"
-      ai-function-lines
-      !if #l9
-        set-variable #l7 #l1
-        set-variable #l8 #l2
-      !else
-        set-variable #l7 &sub $window-aline %ai-attach-lines
-        !iif &les #l7 1  set-variable #l7 1
-        set-variable #l8 &add $window-aline %ai-attach-lines
-        ai-att-lines #l5 #l6
-        !iif &and #l9 &gre #l8 #l9  set-variable #l8 #l9
-        set-variable #l0 ", no function found here"
+      !if &iseq #l9 "f"
+        ai-function-lines
+        !if #l9
+          set-variable #l7 #l1
+          set-variable #l8 #l2
+        !else
+          set-variable #l7 &sub $window-aline %ai-attach-lines
+          !iif &les #l7 1  set-variable #l7 1
+          set-variable #l8 &add $window-aline %ai-attach-lines
+          ai-att-lines #l5 #l6
+          !iif &and #l9 &gre #l8 #l9  set-variable #l8 #l9
+          set-variable #l0 ", no function found here"
+        !endif
       !endif
     !endif
   !endif
-  0x3f set-position "\xa1"
+  ; the window keeps its buffer, view and point, the chat is changed out of sight
+  0xbf set-position "\xa1"
   ai-chat-buffer
   ai-chat-attach #l5 #l6 #l7 #l8
   set-variable #l1 #l9
@@ -4839,18 +4890,23 @@ define-macro ai-insert-block
 ; applies those decided. The keys are letters as a key's case is not told apart
 define-macro ai-review-edits
   ai-busy-check
-  !if &not &exi :ai-chat
-    !force 0 popup-window .ai-chat.current
-    !if &not $status
+  ; from another buffer the chat is read out of sight, the window keeps its buffer and view and
+  ; only the diff is shown
+  set-variable .ai-review-edits.away &not &exi :ai-chat
+  !if .ai-review-edits.away
+    !if &not &exi &spr ":%s:" .ai-chat.current
       ml-write "[AI: there is no chat]"
       !abort
     !endif
+    0xbf set-position "\xb2"
+    find-buffer .ai-chat.current
     end-of-buffer
   !endif
   set-alpha-mark "\xa8"
   ai-edit-reply
   goto-alpha-mark "\xa8"
   !if &not #l1
+    !iif .ai-review-edits.away  goto-position "\xb2"
     ml-write "[AI: no reply to review]"
     !abort
   !endif
@@ -4862,6 +4918,7 @@ define-macro ai-review-edits
     !force 0 delete-buffer "*ai-edits*"
     !force 0 delete-buffer "*ai-att*"
     goto-alpha-mark "\xa8"
+    !iif .ai-review-edits.away  goto-position "\xb2"
     ml-write &con #l8 "[AI: each change has a status line, delete one to apply its change again]" "[AI: no edits to review]"
     !abort
   !endif
@@ -4906,7 +4963,11 @@ define-macro ai-review-edits
   buffer-bind-key ai-diff-apply "C-c C-c"
   buffer-bind-key ai-diff-quit "q"
   -1 buffer-mode "edit"
-  find-buffer #l0
+  !if .ai-review-edits.away
+    goto-position "\xb2"
+  !else
+    find-buffer #l0
+  !endif
   !force 0 popup-window "*ai-diff*"
   !iif &not $status  1 popup-window "*ai-diff*"
   beginning-of-buffer
@@ -6075,13 +6136,32 @@ define-macro ai-redo-edits
 ; in *ai-chat* from any other buffer, asking about each change unless given an argument of 0
 define-macro ai-apply-edits
   ai-busy-check
-  0x01 set-position "\xa1"
+  ; the window it is run from gets back its buffer and view, a change shown may use it
+  0xbf set-position "\xa1"
   !if &not &exi :ai-chat
-    !force 0 popup-window .ai-chat.current
-    !if &not $status
+    !if &not &exi &spr ":%s:" .ai-chat.current
       ml-write "[AI: there is no chat]"
       !abort
     !endif
+    ; the chat is only shown when its last reply has changes, looked for out of sight
+    0xbf set-position "\xb2"
+    find-buffer .ai-chat.current
+    end-of-buffer
+    ai-edit-reply
+    set-variable #l3 0
+    !if #l1
+      set-variable $window-line #l1
+      ai-edit-any
+      set-variable #l3 $result
+    !endif
+    goto-position "\xb2"
+    !if &not #l3
+      ml-write &con #l1 "[AI: no edits to apply]" "[AI: no reply to apply]"
+      !abort
+    !endif
+    ; shown, its status lines say what happened to each change
+    !force 0 popup-window .ai-chat.current
+    !iif &not $status  1 popup-window .ai-chat.current
     end-of-buffer
   !endif
   ; the edits are reviewed now rather than once the user stops typing
@@ -6091,13 +6171,13 @@ define-macro ai-apply-edits
   ai-edit-reply
   goto-alpha-mark "\xa8"
   !if &not #l1
-    0x01 goto-position "\xa1"
+    goto-position "\xa1"
     ml-write "[AI: no reply to apply]"
     !abort
   !endif
   set-variable #l3 &and @? &not @#
   ai-edit-run #l1 #l2 #l3
-  0x01 goto-position "\xa1"
+  goto-position "\xa1"
 !emacro
 
 ; undo the edits kept by the last ai-apply-edits, unless a line has been changed since
@@ -6264,14 +6344,15 @@ define-macro ai-undo-edits
   !iif &seq #l9 ""  !return
   set-variable #l0 #l9
   ai-cb-save
-  0x01 set-position "\xb1"
+  ; the window the user is in gets back its buffer and view, a change shown may use it
+  0xbf set-position "\xb1"
   !force 0 popup-window #l0
   !iif &not $status  1 popup-window #l0
   end-of-buffer
   ai-edit-reply
   set-variable .ai-apply-edits.msg ""
   !iif #l1  !force ai-edit-run #l1 #l2 0
-  0x01 goto-position "\xb1"
+  goto-position "\xb1"
   ai-cb-restore
   ; the window change clears the message line when run as a callback
   !if &len .ai-apply-edits.msg
@@ -7080,7 +7161,9 @@ define-macro ai-continue
   !endif
 !emacro
 
-; quote the selected text in the question being written, as > lines
+; quote the selected text in the question being written, as > lines. The windows are left as
+; they are: from another buffer the chat is changed where it is shown, or out of sight when it is
+; not, and the window quoted from keeps its buffer and view
 define-macro ai-quote
   ai-get-region
   !if &not #l9
@@ -7089,7 +7172,8 @@ define-macro ai-quote
   !endif
   set-variable #l5 &exi :ai-chat
   set-variable #l0 $buffer-bname
-  0x53f set-position "\xa1"
+  ; the window, its view and the point, to come back to
+  0x5bf set-position "\xa1"
   set-variable $window-line #l1
   set-variable $window-col #l2
   set-mark
@@ -7113,24 +7197,32 @@ define-macro ai-quote
       !break
     !endif
   !done
+  ; each line up to it starts with >, the rest is dropped
+  !if #l8
+    beginning-of-buffer
+    !while &not &gre $window-line #l8
+      insert-string &con &xse @wl "[ \t]*" ">" "> "
+      forward-line
+      beginning-of-line
+    !done
+    set-mark
+    end-of-buffer
+    !force -1 kill-region
+  !endif
+  ; the quote is not left showing in the window, deleting it there would put another buffer in
+  goto-position "\xa1"
   !if &not #l8
     !force 0 delete-buffer "*ai-quote*"
-    find-buffer #l0
     ml-write "[AI: nothing to quote]"
     !abort
   !endif
-  ; each line up to it starts with >, the rest is dropped
-  beginning-of-buffer
-  !while &not &gre $window-line #l8
-    insert-string &con &xse @wl "[ \t]*" ">" "> "
-    forward-line
-    beginning-of-line
-  !done
-  set-mark
-  end-of-buffer
-  !force -1 kill-region
-  0x01 set-position "\xa1"
-  ai-chat
+  !if #l5
+    set-variable .ai-chat.current $buffer-bname
+  !else
+    ; the chat where it is shown, else changed in this window and the window put back
+    !force 0 popup-window .ai-chat.current
+    !iif &not $status  ai-chat-buffer
+  !endif
   ai-chat-map
   set-variable #l1 .ai-chat.map-last
   !iif #l1  set-variable $window-line #l1
@@ -7150,8 +7242,9 @@ define-macro ai-quote
   end-of-buffer
   insert-string "\n"
   !if &not #l5
-    0x01 goto-position "\xa1"
-    ml-write "[AI: quoted in the chat]"
+    set-variable #l1 $buffer-bname
+    goto-position "\xa1"
+    ml-write &spr "[AI: quoted in %s]" #l1
   !endif
 !emacro
 
@@ -7599,7 +7692,11 @@ define-macro ai-fold
   !iif &not $status  1 popup-window #l0
   set-variable .ai-send.tool-chat #l0
   set-variable .ai-send.tool-msg ""
+  ; the results and the next request go at the end, the point stays unless it follows the reply
+  ai-point-keep
+  set-variable #l8 $result
   !force ai-tool-run-all
+  !iif &and &not #l8 &seq $buffer-bname #l0  goto-alpha-mark "\xaf"
   0x01 goto-position "\xb1"
   ai-cb-restore
   !if &len .ai-send.tool-msg
@@ -8174,6 +8271,7 @@ set-variable .ai-send.busy-chats "|"
 set-variable .ai-send.lock 0
 set-variable .ai-send.tool-chats "|"
 set-variable .ai-apply-edits.review-chats "|"
+set-variable .ai-review-edits.away 0
 set-variable .ai-insert-block.insert-chats "|"
 set-variable .ai-send.bell-chats "|"
 set-variable .ai-send.pipe ""

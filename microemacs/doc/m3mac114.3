@@ -247,6 +247,10 @@ on from one line to the next, its fences found as above, while emphasis, links,
 strings and comments end with their line, so code pasted outside a block cannot
 spoil the colours of the rest of the chat. Code blocks are drawn in one colour,
 as a language's own hilighting could leave a string open past the block's end.
+The role lines stand out from the headings, each role on its own colour of
+background, \fC##\ You\fR on yellow, \fC##\ AI\fR on cyan, \fC##\ System\fR on
+magenta and \fC##\ Tool\fR on green, from the colour scheme's highlight colours, with the
+comment after one, such as the model that wrote a reply, drawn as a comment.
 .PP
 Some of the chat is the editor's and is not sent back as the model's words: a
 note such as \fC[AI: cancelled]\fR or \fC[AI error: ...]\fR, a reply's thinking
@@ -441,12 +445,13 @@ adds an attachment to the question being written, starting a new \fC## You\fR
 part when the chat does not end in one. In the chat it prompts for files, with
 completion, one after another until \fCRETURN\fR is pressed on the directory
 that the prompt starts with, or given an argument for buffers, such as
-\fC*compile*\fR, until an empty name; a buffer of a file is attached as the file. In any other buffer it attaches without the line
-numbers having to be typed:
+\fC*compile*\fR, until an empty name; a buffer of a file is attached as the file.
+In any other buffer it attaches without the line numbers having to be typed,
+and without the windows changing:
 .BS
-on a line of a \fC*grep*\fR or compile buffer, the lines around that match,
-.BU
 with an active region, the lines of the region,
+.BU
+on a line of a \fC*grep*\fR or compile buffer, the lines around that match,
 .BU
 otherwise it asks whether to attach the function around the cursor, found with
 the patterns the major mode uses to collapse functions and taking in the
@@ -638,7 +643,9 @@ writing when it was cut off in one.
 .PP
 .B ai-quote
 adds the text of the region, in the chat or any other buffer, to the question
-being written, each line starting with \fC>\fR.
+being written, each line starting with \fC>\fR. The windows stay as they are:
+from another buffer the chat is changed in its window when it is shown, else
+out of sight.
 .PP
 .B ai-paste
 pastes the text last copied, as \fByank\fR would, into the question being
@@ -926,6 +933,14 @@ buffers the editor made for it, and the rest of them once no chat is left, but n
 uses.
 Renaming a chat buffer while a reply is coming in stops the reply, saying so in the chat.
 .PP
+A command run from another buffer leaves that buffer and its view in its window.
+Those that show something, such as the chat for
+.BR ai-ask ,
+the diff of
+.B ai-review-edits
+or the changes being applied, use another window for it, splitting the window
+when it is the only one.
+.PP
 A \fC@cmd\fR line runs a shell command whenever its question is sent, so a chat
 written by someone else is worth reading first; each command is asked about the
 first time it is run in a chat. The tools only read files, and only once the user
@@ -936,12 +951,16 @@ saved file is sent instead, or nothing when the buffer also has unsaved changes,
 and an edit to them fails until the part is opened.
 .PP
 With \fCcurl\fR the reply streams into the chat as it is written and editing can
-carry on meanwhile. The API key is passed in a header file readable only by the
-user, which is deleted as soon as the reply starts. The built in HTTP client
-waits for the whole reply, during which the editor does not respond; it keeps
-the key in memory, removing flag \fCd\fR from \fB%http-flags\fR for the request
-so the key is not logged in \fC*http-console*\fR. HTTPS through the built in
-client needs a version of \*(mS built with OpenSSL.
+carry on meanwhile. A cursor left at the end of the reply follows it down to the
+new \fC## You\fR, and text typed there is moved under it, ready to be sent next.
+A cursor moved anywhere else stays there with its view while the reply comes in
+and when it ends, so earlier parts can be read. The API key is passed in a
+header file readable only by the user, which is deleted as soon as the reply
+starts. The built in HTTP client waits for the whole reply, during which the
+editor does not respond; it keeps the key in memory, removing flag \fCd\fR from
+\fB%http-flags\fR for the request so the key is not logged in
+\fC*http-console*\fR. HTTPS through the built in client needs a version of
+\*(mS built with OpenSSL.
 .PP
 A reply line cannot grow past the 65000 character line limit, so a longer one is
 broken. A request is built as UTF-8, which needs a version of \*(mS with Unicode
