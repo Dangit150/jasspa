@@ -36,6 +36,12 @@
 .XI ai-set-profile - "Choose the AI server profile"
 .XI ai-commit-message - "Write a git commit message with the AI"
 .XI ai-fix-error - "Ask the AI to fix the error on the current line"
+.XI ai-continue - "Have the AI go on with its last reply"
+.XI ai-save-edits - "Save the files changed by AI edits"
+.XI ai-system - "Edit the system prompt of the AI chat"
+.XI ai-preview - "Show what the AI chat would send"
+.XI ai-paste - "Paste into the AI chat as a code block"
+.XI ai-redo-edits - "Ask the AI again for the edits that failed"
 .SH NAME
 .Me "|ai-chat"
 ai-chat \- Open the AI coding assistant chat
@@ -120,6 +126,24 @@ ai-commit-message \- Write a git commit message with the AI
 .br
 .Me "|ai-fix-error"
 ai-fix-error \- Ask the AI to fix the error on the current line
+.br
+.Me "|ai-continue"
+ai-continue \- Have the AI go on with its last reply
+.br
+.Me "|ai-save-edits"
+ai-save-edits \- Save the files changed by AI edits
+.br
+.Me "|ai-system"
+ai-system \- Edit the system prompt of the AI chat
+.br
+.Me "|ai-preview"
+ai-preview \- Show what the AI chat would send
+.br
+.Me "|ai-paste"
+ai-paste \- Paste into the AI chat as a code block
+.br
+.Me "|ai-redo-edits"
+ai-redo-edits \- Ask the AI again for the edits that failed
 .Me $a
 .SH SYNOPSIS
 .na
@@ -141,7 +165,7 @@ ai-fix-error \- Ask the AI to fix the error on the current line
 .br
 \fBai-set-effort\fR "\fIeffort\fR"
 .br
-\fBai-attach\fR [\|"\fIfile\fR"\|]
+[\|\fIn\fR\|] \fBai-attach\fR [\|"\fIfile\fR"\|]
 .br
 \fBai-show-attachment\fR
 .br
@@ -153,11 +177,11 @@ ai-fix-error \- Ask the AI to fix the error on the current line
 .br
 \fBai-review-edits\fR
 .br
-\fBai-retry\fR
+[\|\fIn\fR\|] \fBai-retry\fR
 .br
 \fBai-quote\fR
 .br
-\fBai-chat-open\fR "\fIchat\fR"
+[\|\fIn\fR\|] \fBai-chat-open\fR [\|"\fIchat\fR"\|]
 .br
 \fBai-fork\fR
 .br
@@ -178,6 +202,18 @@ ai-fix-error \- Ask the AI to fix the error on the current line
 \fBai-commit-message\fR
 .br
 \fBai-fix-error\fR
+.br
+\fBai-continue\fR
+.br
+\fBai-save-edits\fR
+.br
+\fBai-system\fR
+.br
+\fBai-preview\fR
+.br
+[\|\fIn\fR\|] \fBai-paste\fR
+.br
+\fBai-redo-edits\fR
 .ad
 .SH DESCRIPTION
 These commands hold a conversation about code with an AI model through an OpenAI
@@ -245,7 +281,7 @@ directory, and send what it writes, up to \fB%ai-attach-cmd-lines\fR lines:
 in each chat; \fC@diff\fR sends \fCgit diff HEAD\fR of the file or directory, so
 the changes not yet committed; and \fC@tree\fR lists the files of the directory,
 from \fCgit ls-files\fR or, outside git, by reading the directories, leaving out
-those starting with a dot. A file an edit names that is not attached is then
+those starting with a dot and links to directories. A file an edit names that is not attached is then
 taken to be relative to the tree's directory. These need \fCgit\fR, and a shell
 for \fC@cmd\fR.
 .PP
@@ -260,14 +296,42 @@ commands below use from other buffers.
 .B ai-send
 sends the chat in the current buffer, the last part of which must be a
 \fC## You\fR question. The reply is added under a new \fC## AI\fR line, followed
-by an empty \fC## You\fR for the next question. Only one request may run at a
-time. While it runs the chat's mode line says how it is going, such as
+by an empty \fC## You\fR for the next question. Each chat may have one request
+running, so several chats can wait for their replies at once, each from its own
+server and model; a command that would change a chat whose request is running says
+it is busy. While a request runs its chat's mode line says how it is going, such as
 \fC[AI thinking 12s]\fR or \fC[AI writing 30s]\fR, and when it ends the message
-line gives the tokens it used and the chat's total. A reply cut short by the
+line gives the tokens it used and the chat's total, naming the chat when there is
+more than one. The questions about a reply that is in, such as whether its tool
+calls may run or its edits be kept, are asked one chat at a time, and not while
+another command is asking something or building a request. A reply cut short by the
 model's output limit or by a content filter is noted after it. A request that
 gets no connection, or a rate limit or server error, before any of the reply
 has arrived is sent again after \fB%ai-retry-wait\fR seconds, twice as long each
-time, up to \fB%ai-retries\fR times; \fCC-c C-k\fR stops the wait.
+time, or as long as the server asks with a \fCRetry-After\fR header when the
+reply streams through \fCcurl\fR, up to \fB%ai-retries\fR times;
+\fCC-c C-k\fR stops the wait. It is not sent again when the account is out of
+credit or the server asks for a wait of over two minutes. When the key comes
+from \fB%ai-api-key-command\fR and the server refuses it, as when it has run
+out, the command is run again for a new key and the request sent again, once.
+.PP
+When the chat ends in a reply whose tool calls have no results, as when their
+review was missed or the chat was saved before it,
+.B ai-send
+reviews them, see below, and sends the chat with their results. A tool call that
+is left with no result, such as one a question was written after, is not sent,
+as the API would refuse it.
+.PP
+.B ai-preview
+shows what
+.B ai-send
+would send for the chat, without sending it, in the \fC*ai-request*\fR buffer:
+the model, effort, profile and server, the size in characters with a guess of
+the tokens, and each message as text under a heading such as \fC## system\fR or
+\fC## user\fR, with the attachments read as they are now, the system prompt
+and its edit block instructions, and what happened to the last reply's edits.
+The JSON sent is a little larger, as its text is escaped. A \fC@cmd\fR
+attachment is run to show what it writes.
 .PP
 In a chat buffer the following keys are bound, and listed at the top of a new
 chat:
@@ -277,12 +341,18 @@ chat:
 .B ai-cancel
 .IP "\fC\*cc g\fR"
 .B ai-retry
+.IP "\fC\*cc >\fR"
+.B ai-continue
+.IP "\fC\*cc l\fR"
+.B ai-preview
 .IP "\fC\*cc f\fR"
 .B ai-attach
 .IP "\fC\*cc v\fR"
 .B ai-show-attachment
 .IP "\fC\*cc q\fR"
 .B ai-quote
+.IP "\fC\*cc y\fR"
+.B ai-paste
 .IP "\fC\*cc e\fR"
 .B ai-edit
 .IP "\fC\*cc a\fR"
@@ -291,6 +361,10 @@ chat:
 .B ai-review-edits
 .IP "\fC\*cc u\fR"
 .B ai-undo-edits
+.IP "\fC\*cc s\fR"
+.B ai-save-edits
+.IP "\fC\*cc j\fR"
+.B ai-redo-edits
 .IP "\fC\*cc i\fR"
 .B ai-insert-block
 .IP "\fC\*cc m\fR"
@@ -299,6 +373,8 @@ chat:
 .B ai-set-effort
 .IP "\fC\*cc p\fR"
 .B ai-set-profile
+.IP "\fC\*cc t\fR"
+.B ai-system
 .IP "\fC\*cc n\fR"
 .B ai-new
 .IP "\fC\*cc o\fR"
@@ -364,7 +440,8 @@ the new code.
 adds an attachment to the question being written, starting a new \fC## You\fR
 part when the chat does not end in one. In the chat it prompts for files, with
 completion, one after another until \fCRETURN\fR is pressed on the directory
-that the prompt starts with. In any other buffer it attaches without the line
+that the prompt starts with, or given an argument for buffers, such as
+\fC*compile*\fR, until an empty name; a buffer of a file is attached as the file. In any other buffer it attaches without the line
 numbers having to be typed:
 .BS
 on a line of a \fC*grep*\fR or compile buffer, the lines around that match,
@@ -470,6 +547,20 @@ question rather than seeing these lines in its reply, and lines like them that
 the model writes in a reply are removed. When a kept change adds or removes
 lines the line ranges of the file's attachments are moved to match.
 .PP
+The files that kept changes are left unsaved, as the message says, unless
+\fB%ai-edit-save\fR is set.
+.B ai-save-edits
+saves the files changed by the edits kept, and undone, that have not been saved
+since, from any buffer.
+.PP
+.B ai-redo-edits
+asks the model again for the edits of its last reply that failed. It adds
+\fB%ai-redo-prompt\fR to the question being written, after any words already
+there, and sends it; the request starts by telling the model what happened to
+each edit and why, and the attached files are sent as they are now. The edits
+of the reply are reviewed once it is in, as for
+.BR ai-edit .
+.PP
 .B ai-undo-edits
 puts back the lines changed by the last
 .B ai-apply-edits
@@ -534,11 +625,28 @@ of the reply once it is in.
 asks the last question again, replacing its reply and anything after it, such as
 after an error or with another model or effort. It asks first when the reply's
 edits were applied, and will not lose a question that has been written but not
-sent.
+sent. Given an argument it prompts for a model and effort to ask with this time
+only, so models can be compared without changing the chat's.
+.PP
+.B ai-continue
+has the model go on with its last reply, such as one cut short by the model's
+output limit or a lost connection. The editor's notes and the empty question
+after the reply are removed, the model is asked to continue from exactly where
+it stopped with \fB%ai-continue-prompt\fR, which is not added to the chat, and
+what it writes is added to the end of the reply, inside the code block it was
+writing when it was cut off in one.
 .PP
 .B ai-quote
 adds the text of the region, in the chat or any other buffer, to the question
 being written, each line starting with \fC>\fR.
+.PP
+.B ai-paste
+pastes the text last copied, as \fByank\fR would, into the question being
+written as a fenced code block, at the cursor when it is in the question and
+otherwise at its end. The block is tagged with the major mode of the buffer in
+the window last used before the chat's, which is usually where the text was
+copied, and is left untagged for plain text; given an argument it asks for the
+language. The fence has more backticks than any line of the text.
 .PP
 .B ai-fork
 starts a new chat, \fC*ai-chat:\fIn\fC*\fR, holding the chat up to the end of
@@ -559,14 +667,24 @@ and its first question, such as \fC2026-11-12-1530-why-does-the-parser-fail.md\f
 .B ai-chat-open
 prompts for one of them, with completion and the newest offered first, and opens
 it in the chat window in place of the chat there, which is saved first; going on
-with it carries on saving to its file.
+with it carries on saving to its file. A saved chat that ends in tool calls with
+no results is left that way for
+.B ai-send
+to review them. Given an argument it lists the saved chats instead, newest
+first, in the \fC*ai-saved*\fR buffer, where \fCRETURN\fR opens the chat on
+the line, \fCd\fR deletes it after asking, \fCr\fR renames it, \fCs\fR
+lists only the chats holding some text, ignoring case, with the first line that
+does, \fCa\fR lists them all again and \fCq\fR quits. The chat open in a chat
+buffer cannot be deleted, and one renamed goes on saving under its new name. The
+search needs \fCgrep\fR.
 .B ai-new
 starts a new chat in the chat window; when chats are not saved it asks first if
 the chat holds any replies.
 .PP
 .B ai-cancel
-stops a reply that is streaming in, keeping what has arrived so far, or the wait
-before a request is sent again.
+stops the request of the chat, the current buffer or else the chat last used: a
+reply that is streaming in, keeping what has arrived so far, or the wait before a
+request is sent again. Requests in other chats go on.
 .PP
 .B ai-set-model
 fetches the list of models from the server and prompts for one, with
@@ -587,11 +705,29 @@ reason needs as it may refuse the request otherwise. The effort is saved in the
 registry like the model and is shown in the message line while a request is
 sent.
 .PP
+Each chat has its own profile, model and effort, which are used whenever it is
+sent and shown in its mode line, for example \fC[AI gpt-5.1 high, work]\fR, or
+the request's model and how it is going while one is sent.
+.BR ai-set-model ,
+.B ai-set-effort
+and
+.B ai-set-profile
+set those of the chat they are run in, or of the chat last used when run from
+another buffer. A new chat starts with those in use, a branch with those of the
+chat it came from, and a saved chat that is opened takes those of its last reply,
+which its role line records.
+.PP
+.B ai-system
+moves to the chat's \fC## System\fR part, adding one at its top filled with
+\fB%ai-system-prompt\fR when it has none, so the instructions the model is given
+can be changed for the chat; the part is sent in place of \fB%ai-system-prompt\fR.
+.PP
 .B ai-set-profile
 switches between servers. A profile \fIname\fR listed in \fB%ai-profiles\fR is
 given by the variables \fB%ai-profile-\fIname\fB-\fIsetting\fR for any of the
 settings \fCbase-url\fR, \fCapi-key\fR, \fCapi-key-command\fR, \fCtransport\fR,
-\fCapi\fR, \fCextra-json\fR, \fCtools\fR, \fCmodel\fR and \fCeffort\fR; a setting
+\fCcurl-args\fR, \fCtimeout\fR, \fCapi\fR, \fCextra-json\fR, \fCtools\fR,
+\fCsystem-prompt\fR, \fCmodel\fR and \fCeffort\fR; a setting
 a profile does not give is that of the \fCdefault\fR profile, the plain
 variables. The model and effort last chosen with each profile, and the profile
 itself, are kept in the registry.
@@ -601,7 +737,8 @@ project, search the project's files with \fCgrep\fR, or list them. The project
 is the directory of an attached \fC@tree\fR, else the directory the
 attachments' names start from. Each request is shown and only run when the user
 allows it: \fCy\fR runs it, \fCn\fR refuses it, \fCa\fR runs it and the rest of
-the reply's requests, and \fCq\fR refuses the rest and stops. The calls are
+the reply's requests in the project, and \fCq\fR refuses the rest and stops. A
+request for a file outside the project is always asked about. The calls are
 kept in the reply as \fCtool-call\fR blocks and each result is added as a
 \fC## Tool\fR part, then the chat is sent again, up to \fB%ai-tool-rounds\fR
 times for a question.
@@ -650,11 +787,17 @@ path. \fB%ai-curl\fR gives the \fCcurl\fR program, \fCcurl\fR by default, and
 .IP \fB%ai-timeout\fR
 The seconds a reply may go without sending anything before it is given up, 600
 by default. The built in client's limit is \fB%sock-recv-timeout\fR, which is set
-to this when this file is loaded unless already set, and only takes effect when
-no URL has been loaded yet.
+to this when the built in client is first used for a request unless already set,
+and only takes effect when no URL has been loaded yet; it is not changed when
+\fCcurl\fR is used.
 .IP "\fB%ai-retries\fR, \fB%ai-retry-wait\fR"
 How many times a request that failed for a reason that may pass is sent again,
-2 by default, and the seconds waited before the first time, 5 by default.
+2 by default, and the seconds waited before the first time, 5 by default, unless
+the server asks for another wait.
+.IP \fB%ai-bell\fR
+When to ring the bell, or show \fC[BELL]\fR when \fB$quiet\fR is set, as a
+reply comes in: \fC0\fR (the default) never, \fC1\fR when the chat is not the
+current buffer and \fC2\fR always.
 .IP \fB%ai-usage\fR
 When 1 (the default) a streamed reply asks for the tokens it used, which a few
 servers may not take.
@@ -663,7 +806,9 @@ When 1 the thinking that some servers send with a reply, or OpenAI's summary of
 it, is shown in a \fCthinking\fR block before the reply, 0 by default. It is
 not sent back.
 .IP \fB%ai-system-prompt\fR
-The instructions sent before the chat.
+The instructions sent before the chat. By default they ask for code in fenced
+blocks and, for code that is not in an attached file, the complete replacement
+when it is to change; \fB%ai-edit-prompt\fR covers attached files.
 .IP \fB%ai-request-max\fR
 When a request is larger than this many characters, by default
 \fB%ai-attach-max\fR or 200000 (about 50000 tokens), the user is asked before it
@@ -699,17 +844,28 @@ When 1 (the default) the edits of a reply to
 are reviewed as soon as it is in, set to 0 to review them with
 .B ai-apply-edits
 instead.
+.IP \fB%ai-edit-save\fR
+What happens to the files changed by the edits kept:
+\fC0\fR (the default) leaves them unsaved for
+.BR ai-save-edits ,
+\fC1\fR asks whether to save them each time edits are applied and \fC2\fR
+saves them.
+.IP \fB%ai-continue-prompt\fR
+The request
+.B ai-continue
+sends to have the model go on with its reply.
 .IP \fB%ai-edit-prompt\fR
 The instructions on edit blocks added to the system prompt, or to a \fC## System\fR
 part, when the chat has attachments of files or buffers.
 .IP \fB%ai-edit-lenient\fR
 When 1 (the default) the other forms of change described above are applied as
 well as edit blocks.
-.IP "\fB%ai-fix-prompt\fR, \fB%ai-commit-prompt\fR"
+.IP "\fB%ai-fix-prompt\fR, \fB%ai-commit-prompt\fR, \fB%ai-redo-prompt\fR"
 The questions asked by
-.B ai-fix-error
+.BR ai-fix-error ,
+.B ai-commit-message
 and
-.BR ai-commit-message .
+.BR ai-redo-edits .
 .IP "\fB%ai-tools\fR, \fB%ai-tool-rounds\fR"
 Whether the model may ask for the tools described above, 0 by default, and how
 many times a chat is sent again with their results, 10 by default.
@@ -736,6 +892,26 @@ set-variable %ai-profile-local-api-key-command ""
 set-variable %ai-profile-local-model "qwen2.5-coder"
 .CE 0
 .Me $ehf-scheme
+The chat's keys are only bound in a chat. These commands also work from other
+buffers, so may be given global keys; the ones below follow the chat's where
+they can and leave \*(mS's own \fC\*cc g\fR, \fC\*cc r\fR, \fC\*cc s\fR and
+\fC\*cc z\fR alone:
+.Me $emf-scheme
+.CS
+global-bind-key ai-chat           "C-c c"
+global-bind-key ai-ask            "C-c k"
+global-bind-key ai-code-action    "C-c x"
+global-bind-key ai-edit           "C-c e"
+global-bind-key ai-attach         "C-c f"
+global-bind-key ai-quote          "C-c q"
+global-bind-key ai-insert-block   "C-c i"
+global-bind-key ai-apply-edits    "C-c a"
+global-bind-key ai-review-edits   "C-c d"
+global-bind-key ai-undo-edits     "C-c u"
+global-bind-key ai-fix-error      "C-c w"
+global-bind-key ai-cancel         "C-c C-k"
+.CE 0
+.Me $ehf-scheme
 .SH NOTES
 These are macros defined in \fCaichat.emf\fR.
 .PP
@@ -748,6 +924,7 @@ Killing a chat buffer saves the chat, stops a request still writing into it and 
 buffers the editor made for it, and the rest of them once no chat is left, but not the record
 .B ai-undo-edits
 uses.
+Renaming a chat buffer while a reply is coming in stops the reply, saying so in the chat.
 .PP
 A \fC@cmd\fR line runs a shell command whenever its question is sent, so a chat
 written by someone else is worth reading first; each command is asked about the
