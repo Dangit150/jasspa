@@ -168,7 +168,13 @@ set-variable .fhook-md.item-list-r3 "H2 \CCb\\1\CCA"
       hilight .hilight.md 0x0a0 &spr "```{\\.%s}" #l1 &ind &cat ".hilight." #l0 .scheme.hide
       hilight .hilight.md 0x0a0 &spr "```{%s[, ][^}]+}" #l1 &ind &cat ".hilight." #l0 .scheme.hide
       hilight .hilight.md 0x0a0 &spr "```{\\.%s[, ][^}]+}" #l1 &ind &cat ".hilight." #l0 .scheme.hide
-      hilight &ind &cat ".hilight." #l0 0x080 "^```" .hilight.md .scheme.hide
+      ; the block ends at a line starting with backticks, which may be indented by up to 3 spaces.
+      ; These are plain tokens flagged to be at the start of the line, as a "^" token is only
+      ; tried after the language's own tokens, such as a backtick quote
+      hilight &ind &cat ".hilight." #l0 0x180 "```" .hilight.md .scheme.hide
+      hilight &ind &cat ".hilight." #l0 0x180 " ```" .hilight.md .scheme.hide
+      hilight &ind &cat ".hilight." #l0 0x180 "  ```" .hilight.md .scheme.hide
+      hilight &ind &cat ".hilight." #l0 0x180 "   ```" .hilight.md .scheme.hide
     !endif
   !emacro
   md-add-file-support "tcl" "tcl"

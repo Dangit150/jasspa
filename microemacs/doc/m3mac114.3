@@ -245,8 +245,19 @@ with a hilighting of its own, worked out from the top of the buffer so the
 colours do not change as the chat is scrolled. Only a fenced code block carries
 on from one line to the next, its fences found as above, while emphasis, links,
 strings and comments end with their line, so code pasted outside a block cannot
-spoil the colours of the rest of the chat. Code blocks are drawn in one colour,
-as a language's own hilighting could leave a string open past the block's end.
+spoil the colours of the rest of the chat. A code block tagged with a language,
+such as \fC```python\fR or \fC```c++\fR, is drawn in the colours that the
+language's major mode gives its files, which are loaded when the tag is first
+seen, also as a reply arrives. Common names that are not a mode's own, such as
+\fCbash\fR, \fCjavascript\fR and \fCpy\fR, are taken as the mode they name. Other
+code blocks are drawn in one colour: those whose tag is not a mode, of tildes, of 4 or more
+backticks, which are used to hold fences of 3, or with fences indented by more
+than 3 spaces. A language's strings and comments run on from line to line as in
+its own files, so code that leaves one open hides the closing fence and draws
+what follows in its colour until it is closed. A reply cut short in such a block
+is given fences of 4 backticks when the block is closed, and
+.B ai-paste
+uses them for code that looks like it leaves a string or comment open.
 The role lines stand out from the headings, each role on its own colour of
 background, \fC##\ You\fR on yellow, \fC##\ AI\fR on cyan, \fC##\ System\fR on
 magenta and \fC##\ Tool\fR on green, from the colour scheme's highlight colours, with the
@@ -653,7 +664,9 @@ written as a fenced code block, at the cursor when it is in the question and
 otherwise at its end. The block is tagged with the major mode of the buffer in
 the window last used before the chat's, which is usually where the text was
 copied, and is left untagged for plain text; given an argument it asks for the
-language. The fence has more backticks than any line of the text.
+language. The fence has more backticks than any line of the text, and at least
+4 when the text looks like it leaves a string or comment open, so it is drawn in
+one colour rather than spoil the chat after it.
 .PP
 .B ai-fork
 starts a new chat, \fC*ai-chat:\fIn\fC*\fR, holding the chat up to the end of

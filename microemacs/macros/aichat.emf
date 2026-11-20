@@ -425,9 +425,12 @@ define-macro ai-chat-keys
 ; would spoil every line below as the chat looks back to its top. Looking back to the top keeps
 ; code and prose from swapping colours as the chat scrolls, a redraw at the end of a 6000 line
 ; chat takes under 3ms. Fences are found as the chat finds them, at the first non-white
-; character and closed by a line of at least as many of the same character, and code is drawn
-; in one colour as a language's own hilighting could leave a string open past its fence
+; character and closed by a line of at least as many of the same character. Code is drawn in
+; one colour, apart from a block whose language is named, see ai-code-lang
 0 define-macro ai-chat-hilight
+  ; no language has its colours yet
+  set-variable .ai-chat.code-seen "|"
+  set-variable .ai-chat.code-hil "|"
   set-variable .hilight.aichat &pinc .hilight.next 1
   set-variable .hilight.aichatE &pinc .hilight.next 1
   set-variable .hilight.aichatB &pinc .hilight.next 1
@@ -529,6 +532,156 @@ define-macro ai-chat-keys
   hilight .hilight.aichatU 0x1080 ")" .hilight.aichat .scheme.hide
 !emacro
 
+; set #p9 to the hilighting of language @1, a code block's info string in lower case, which is the
+; scheme its major mode gives a file, read from its hook file when it is first used. 0 when it
+; has none, or it is markdown's or the chat's, which have their own fences
+0 define-macro ai-code-scheme
+  set-variable #p9 0
+  set-variable #l0 @1
+  !iif &set #l1 &lfind .ai-chat.lang-from #l0  set-variable #l0 &lget .ai-chat.lang-to #l1
+  !iif &lfind .ai-chat.lang-skip #l0  !return
+  !if &not &exi &cat ".hilight." #l0
+    ; a hook file read without giving a scheme has its hilighting turned off. Its fhook is known
+    ; before then, from major-mode
+    !iif &exi &spr ".fhook-%s.setup" #l0  !return
+    !iif &seq &find &cat "hk" #l0 ".emf" "ERROR"  !return
+    !force execute-file &cat "hk" #l0
+    !iif &not &exi &cat ".hilight." #l0  !return
+  !endif
+  set-variable #l1 &ind &cat ".hilight." #l0
+  !iif &not &gre #l1 0  !return
+  !iif &equ #l1 .hilight.aichat  !return
+  !iif &and &exi .hilight.md &equ #l1 .hilight.md  !return
+  set-variable #p9 #l1
+!emacro
+
+; give the code blocks of language @1, the info string after their fence as written, the colours
+; of the language. "```name" enters the language's own scheme, which gives way at a line starting
+; with backticks by branching to 0, the scheme of the buffer it is drawn in: the chat's here and
+; markdown's in a markdown file, which ends a language's block the same way. Both fences may be
+; indented by up to 3 spaces, a block indented further, of 4 or more backticks, which is used to
+; hold fences of 3, or of tildes stays in one colour. The language's strings and comments run on
+; over lines as they do in its files, so code that leaves one open hides its closing fence, and
+; the colours come right at the first fence after it ends. A reply cut short in such a block and
+; code that ai-paste finds leaving a string or comment open get 4 backticks
+0 define-macro ai-code-lang
+  set-variable #l0 @1
+  !iif &not &xse #l0 "[-+#.A-Za-z0-9_]+"  !return
+  !iif &lfind .ai-chat.code-seen #l0  !return
+  set-variable .ai-chat.code-seen &lins .ai-chat.code-seen -1 #l0
+  !iif &not &exi .hilight.aichat  !return
+  ai-code-scheme &slo #l0
+  !iif &not #l9  !return
+  set-variable #l1 #l9
+  set-variable .ai-chat.code-hil &lins .ai-chat.code-hil -1 #l0
+  set-variable #l2 &rep &rep #l0 "." "\\." "+" "\\+"
+  ; plain tokens flagged to be at the start of the line, as a "^" token is only tried after the
+  ; plain ones, the language's own such as a backtick quote, and the chat's fence of any block
+  set-variable #l3 ""
+  !repeat
+    hilight #l1 0x180 &cat #l3 "```" 0 .scheme.hide
+    hilight .hilight.aichat 0x180 &spr "%s```%s[ \t]*$" #l3 #l2 #l1 .scheme.hide
+    hilight .hilight.aichat 0x180 &spr "%s```%s[ \t]+[^`]*$" #l3 #l2 #l1 .scheme.hide
+    set-variable #l3 &cat #l3 " "
+  !until &gre &len #l3 3
+  ; the lines already drawn are drawn again
+  !iif &equ $buffer-hilight .hilight.aichat  set-variable $buffer-hilight .hilight.aichat
+!emacro
+
+; give colours to the languages of the code blocks opened on lines @1 to @2 of the current chat,
+; not including line @2. The point is moved
+0 define-macro ai-code-scan
+  set-variable #l1 @1
+  set-variable #l2 @2
+  !while &les #l1 #l2
+    set-variable $window-line #l1
+    !if &xse @wl .ai-chat.code-fence
+      !iif &not &lfind .ai-chat.code-seen @s2  ai-code-lang @s2
+    !endif
+    set-variable #l1 &add #l1 1
+  !done
+!emacro
+
+; set #p9 to 1 when the code in the current buffer, of language @1, looks like it leaves a string,
+; a block comment or a triple quoted string open at its end, which would hide the closing fence of
+; its code block. The point is moved
+0 define-macro ai-code-open
+  set-variable #p9 0
+  set-variable #l0 &slo @1
+  !iif &set #l1 &lfind .ai-chat.lang-from #l0  set-variable #l0 &lget .ai-chat.lang-to #l1
+  !if &lfind .ai-chat.lang-cblock #l0
+    set-variable #l1 "/*"
+    set-variable #l2 "*/"
+  !elif &lfind "|html|xml|" #l0
+    set-variable #l1 "<!--"
+    set-variable #l2 "-->"
+  !else
+    set-variable #l1 ""
+    !if &seq #l0 "python"
+      ; an odd number of either triple quote
+      ai-code-count "\"\"\""
+      !iif &not $result  ai-code-count "'''"
+      !if $result
+        set-variable #p9 1
+        !return
+      !endif
+    !endif
+  !endif
+  ; a string left open, an odd number of double quotes that are not escaped
+  set-variable #l3 0
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" "\\\\.\\|\""
+    !iif &not $status  !break
+    !iif &seq @s0 "\""  set-variable #l3 &not #l3
+  !done
+  !if #l3
+    set-variable #p9 1
+    !return
+  !endif
+  !iif &not &len #l1  !return
+  ; the last opening is after the last closing
+  end-of-buffer
+  !force search-buffer "bMe" #l1
+  !iif &not $status  !return
+  set-variable #l3 $window-line
+  set-variable #l4 $window-col
+  end-of-buffer
+  !force search-buffer "bMe" #l2
+  !if &not $status
+    set-variable #p9 1
+  !elif &les $window-line #l3
+    set-variable #p9 1
+  !elif &and &equ $window-line #l3 &les $window-col #l4
+    set-variable #p9 1
+  !endif
+!emacro
+
+; set $result to 1 when string @1 is found an odd number of times in the current buffer
+0 define-macro ai-code-count
+  set-variable #l1 0
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "Me" @1
+    !iif &not $status  !break
+    set-variable #l1 &not #l1
+  !done
+  set-variable $result #l1
+!emacro
+
+; give colours to the languages of all the code blocks of the current chat
+0 define-macro ai-code-scan-all
+  0xc0 set-position "\xb4"
+  beginning-of-buffer
+  !repeat
+    !force search-buffer "me" &spr "^%s$" .ai-chat.code-fence
+    !iif &not $status  !break
+    !iif &not &lfind .ai-chat.code-seen @s2  ai-code-lang @s2
+    end-of-line
+  !done
+  0xc0 goto-position "\xb4"
+!emacro
+
 ; make the current buffer a chat
 0 define-macro ai-chat-setup
   !if &not &exi :ai-chat
@@ -539,6 +692,7 @@ define-macro ai-chat-keys
     !if &and &exi .hilight.md &equ $buffer-hilight .hilight.md
       !iif &not &exi .hilight.aichat  ai-chat-hilight
       set-variable $buffer-hilight .hilight.aichat
+      ai-code-scan-all
     !endif
     set-variable :ai-chat 1
     set-variable .ai-chat.key-list 0
@@ -814,6 +968,7 @@ define-macro ai-chat-keys
   set-variable #l4 ""
   set-variable #l5 0
   set-variable #l7 0
+  set-variable #l8 "|"
   beginning-of-buffer
   !repeat
     !force search-buffer "me" .ai-chat.map-regex
@@ -834,6 +989,10 @@ define-macro ai-chat-keys
       ai-fence-line #l6 ""
       set-variable #l3 .ai-chat.fence
       set-variable #l5 $window-line
+      ; the languages named for the first time get their colours once the chat is mapped
+      !if &xse #l6 .ai-chat.code-fence
+        !iif &not &lfind .ai-chat.code-seen @s2  set-variable #l8 &lins #l8 -1 @s2
+      !endif
     !endif
     end-of-line
   !done
@@ -844,6 +1003,10 @@ define-macro ai-chat-keys
   set-variable .ai-chat.map-last #l7
   set-variable .ai-chat.map-open &con &len #l3 #l5 0
   set-variable .ai-chat.map-fence #l3
+  set-variable #l1 0
+  !while &not &seq "" &set #l2 &lget #l8 &inc #l1 1
+    ai-code-lang #l2
+  !done
 !emacro
 
 ; close the code block left open at the end of the current chat, as mapped by ai-chat-map, so a
@@ -858,7 +1021,22 @@ define-macro ai-chat-keys
     !until &or &not &gre $window-line .ai-chat.map-open &not &xse @wl "[ \t]*"
     forward-line
     beginning-of-line
-    insert-string &cat .ai-chat.map-fence "\n"
+    ; a block in its language's colours that was cut short may leave a string or comment open,
+    ; which would hide the closing fence and draw the rest of the chat in its colour, so it is
+    ; given 4 backticks, which keep it in one colour
+    set-variable #l1 $window-line
+    set-variable #l2 .ai-chat.map-fence
+    set-variable $window-line .ai-chat.map-open
+    !if &and &seq #l2 "```" &xse @wl .ai-chat.code-fence
+      !if &lfind .ai-chat.code-hil @s2
+        set-variable $window-col &len @s1
+        insert-string "`"
+        set-variable #l2 "````"
+      !endif
+    !endif
+    set-variable $window-line #l1
+    beginning-of-line
+    insert-string &cat #l2 "\n"
     set-variable .ai-chat.map-open 0
   !endif
 !emacro
@@ -2350,6 +2528,11 @@ define-macro ai-chat
     set-alpha-mark "\xa4"
     set-variable $system #l5
     ai-json-unescape #l6 #l7
+    ; a code block the reply opens is in its language's colours as it comes
+    !if &exi :ai-chat
+      goto-alpha-mark "\xa4"
+      ai-code-scan #l6 $window-line
+    !endif
     ai-target-leave
     find-buffer #l0
     set-variable $window-line #l3
@@ -7309,6 +7492,13 @@ define-macro ai-paste
   !endif
   ai-fence-for "*ai-paste*"
   set-variable #l3 #l9
+  ; code of a named language is drawn in its colours, unless it leaves a string or comment open,
+  ; which would hide the closing fence: 4 backticks keep it in one colour
+  set-variable #l6 0
+  !if &and &len #l2 &seq #l3 "```"
+    ai-code-open #l2
+    !iif &set #l6 #l9  set-variable #l3 "````"
+  !endif
   end-of-buffer
   !iif &gre $window-col 0  insert-string "\n"
   insert-string &cat #l3 "\n"
@@ -7343,7 +7533,12 @@ define-macro ai-paste
   set-variable #l4 $window-line
   ai-edit-append-at #l4 "*ai-paste*"
   !force 0 delete-buffer "*ai-paste*"
-  ml-write &con &len #l2 &spr "[AI: pasted as a %s code block]" #l2 "[AI: pasted as a code block, C-u C-c y asks for its language]"
+  !iif &len #l2  ai-code-lang #l2
+  !if #l6
+    ml-write &spr "[AI: pasted as a %s code block, in one colour as it leaves a comment or string open]" #l2
+  !else
+    ml-write &con &len #l2 &spr "[AI: pasted as a %s code block]" #l2 "[AI: pasted as a code block, C-u C-c y asks for its language]"
+  !endif
 !emacro
 
 ; set #p9 to the | list of the opening fence lines of the code blocks of the current chat
@@ -8263,6 +8458,19 @@ set-variable .ai-chat.map-open 0
 set-variable .ai-chat.map-fence ""
 set-variable .ai-chat.map-regex &spr "^\\(%s\\|[ \t]*\\(```\\|~~~\\).*\\|%s\\)$" .ai-chat.role-re .ai-chat.att-line
 set-variable .ai-chat.fence-regex "^[ \t]*\\(```\\|~~~\\)"
+; for &xse, the opening fence of a code block whose language is named, as @s2, indented by up
+; to 3 spaces. 4 or more backticks do not match
+set-variable .ai-chat.code-fence "\\( \\{,3\\}\\)```\\([-+#.A-Za-z0-9_]+\\)\\([ \t].*\\)?"
+; the names of languages in code blocks that are not their major mode's, and the modes they are
+; drawn as. A name the editor's modes do not know is drawn in one colour, as are the skipped
+; modes, which are prose or have fences of their own
+set-variable .ai-chat.lang-from "|bash|shell|zsh|ksh|csh|javascript|jsx|mjs|node|typescript|tsx|golang|c++|cxx|cc|hpp|hxx|hh|h|csharp|c#|py|python3|py3|rb|rs|kt|kts|yml|makefile|mk|mak|elisp|emacs-lisp|el|pl|pm|htm|xhtml|svg|xsl|tex|cmd|batch|pwsh|powershell|jl|hs|haskell|erl|fortran|f90|f77|pas|delphi|scm|patch|toml|matlab|vba|gradle|jsonc|json5|"
+set-variable .ai-chat.lang-to "|sh|sh|sh|sh|sh|js|js|js|js|ts|ts|go|cpp|cpp|cpp|cpp|cpp|cpp|c|cs|cs|python|python|python|ruby|rust|kotlin|kotlin|yaml|make|make|make|lisp|lisp|lisp|perl|perl|html|html|xml|xml|latex|bat|bat|ps1|ps1|julia|hask|hask|erlang|f|f|f|pascal|pascal|scheme|diff|ini|octave|vb|groovy|json|json|"
+set-variable .ai-chat.lang-skip "|md|markdown|rmd|qd|typst|mdview|wiki|txt|text|doc|ehf|man|info|binary|rbin|blist|dirlst|dirtre|ipipe|lists|mereg|"
+; the modes whose block comments are /* */, for ai-code-open
+set-variable .ai-chat.lang-cblock "|c|cpp|cs|java|js|ts|go|rust|css|kotlin|swift|scala|dart|groovy|php|sql|jsp|haxe|zig|vala|idl|"
+!iif &not &exi .ai-chat.code-seen  set-variable .ai-chat.code-seen "|"
+!iif &not &exi .ai-chat.code-hil  set-variable .ai-chat.code-hil "|"
 ; the variables of a request's state, held for each chat, and their values for a new one
 set-variable .ai-send.ctx-vars "|busy|target|got|cancel|failed|empty|stopped|finish-reason|usage-got|usage-in|usage-out|usage-cached|usage-reasoning|think|tc-n|attempt|retry-at|req-key|req-keycmd|req-how|req-path|req-url|req-curl|req-curl-args|req-timeout|req-file|hdr-file|rsp-file|req-note|req-resp|model|effort|reply-info|t0|sline|cont|fence0|key-retried|key-refresh|tool-round|review-next|insert-next|insert-src|"
 set-variable .ai-send.ctx-defaults "|0||0|0|0|0|||0|0|0|0|0|0|0|0|0||||||||600|||||0||||0|1|0||0|0|0|0|0||"
